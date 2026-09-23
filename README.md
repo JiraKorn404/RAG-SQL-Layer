@@ -70,7 +70,7 @@ uv run jupyter lab notebooks/demo.ipynb
 
 ```python
 from rag_sql.display import run_and_display
-run_and_display("Top 5 customers by revenue last quarter?")
+run_and_display("Which department has the highest average salary?")
 ```
 
 ## Development

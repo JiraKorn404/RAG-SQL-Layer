@@ -1,0 +1,79 @@
+# Question -> SQL pairs, embedded into the vector index and retrieved by similarity to the
+# user's question. Keep the SQL valid PostgreSQL for the current schema.
+# Re-run `uv run rag-sql-index` after editing.
+
+- question: How many employees are there in each department?
+  sql: |
+    SELECT coalesce(department, 'Unknown') AS department, count(*) AS employees
+    FROM employees
+    GROUP BY 1
+    ORDER BY employees DESC;
+
+- question: What is the average salary by city?
+  sql: |
+    SELECT city, round(avg(salary), 2) AS avg_salary
+    FROM employees
+    WHERE salary IS NOT NULL
+    GROUP BY city
+    ORDER BY avg_salary DESC;
+
+- question: What is the average salary and performance rating in each department?
+  sql: |
+    SELECT department,
+           round(avg(salary), 2) AS avg_salary,
+           round(avg(performance_rating), 2) AS avg_rating
+    FROM employees
+    WHERE department IS NOT NULL
+    GROUP BY department
+    ORDER BY avg_salary DESC;
+
+- question: Who are the 5 highest paid employees?
+  sql: |
+    SELECT emp_name, department, salary
+    FROM employees
+    WHERE salary IS NOT NULL
+    ORDER BY salary DESC
+    LIMIT 5;
+
+- question: How many employees joined each year?
+  sql: |
+    SELECT extract(year FROM join_date)::int AS join_year, count(*) AS employees
+    FROM employees
+    GROUP BY join_year
+    ORDER BY join_year;
+
+- question: What share of employees work remotely in each department?
+  sql: |
+    SELECT coalesce(department, 'Unknown') AS department,
+           round(100.0 * count(*) FILTER (WHERE remote_work) / count(*), 1) AS remote_pct
+    FROM employees
+    GROUP BY 1
+    ORDER BY remote_pct DESC;
+
+- question: Which employees in Engineering have a performance rating of 5?
+  sql: |
+    SELECT emp_name, city, salary
+    FROM employees
+    WHERE department = 'Engineering' AND performance_rating = 5
+    ORDER BY emp_name;
+
+- question: What is the average performance rating by age group?
+  sql: |
+    SELECT CASE
+             WHEN age < 30 THEN 'Under 30'
+             WHEN age < 40 THEN '30-39'
+             WHEN age < 50 THEN '40-49'
+             ELSE '50+'
+           END AS age_group,
+           round(avg(performance_rating), 2) AS avg_rating,
+           count(*) AS employees
+    FROM employees
+    WHERE age IS NOT NULL AND performance_rating IS NOT NULL
+    GROUP BY age_group
+    ORDER BY min(age);
+
+- question: How many employees are missing salary or department data?
+  sql: |
+    SELECT count(*) FILTER (WHERE salary IS NULL) AS missing_salary,
+           count(*) FILTER (WHERE department IS NULL) AS missing_department
+    FROM employees;

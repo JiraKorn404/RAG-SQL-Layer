@@ -1,0 +1,7 @@
+{
+  // SQL in this repo is PostgreSQL. Stop the Oracle SQL Developer extension from claiming
+  // .sql files as PL/SQL, which flags valid Postgres syntax (BEGIN;, COPY, ::casts) as errors.
+  "files.associations": {
+    "*.sql": "sql"
+  }
+}
