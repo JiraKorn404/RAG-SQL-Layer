@@ -3,5 +3,8 @@
   // .sql files as PL/SQL, which flags valid Postgres syntax (BEGIN;, COPY, ::casts) as errors.
   "files.associations": {
     "*.sql": "sql"
-  }
+  },
+  // Use the uv-managed venv for the Python extension and as the notebook kernel.
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.terminal.activateEnvironment": true
 }
