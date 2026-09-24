@@ -71,7 +71,15 @@ def stores(chat_store, query_history) -> dict:
     return {"chat_store": chat_store, "query_history": query_history}
 
 
-def make_turn(question: str, sql: str | None = "SELECT 1", answer: str = "A.") -> Turn:
+def make_turn(
+    question: str,
+    sql: str | None = "SELECT 1",
+    answer: str = "A.",
+    *,
+    sql_reasoning: str | None = None,
+    answer_reasoning: str | None = None,
+    model: str | None = None,
+) -> Turn:
     return {
         "question": question,
         "standalone": question,
@@ -79,6 +87,9 @@ def make_turn(question: str, sql: str | None = "SELECT 1", answer: str = "A.") -
         "row_count": 1 if sql else None,
         "answer": answer,
         "error": None if sql else "boom",
+        "sql_reasoning": sql_reasoning,
+        "answer_reasoning": answer_reasoning,
+        "model": model,
     }
 
 

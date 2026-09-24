@@ -15,7 +15,7 @@ from rag_sql.agent.state import AgentState
 from rag_sql.config import Settings, get_settings
 from rag_sql.db.connection import get_engine
 from rag_sql.db.query import QueryResult, run_query
-from rag_sql.llm import get_chat_model
+from rag_sql.llm import chat_model_name, get_chat_model
 from rag_sql.memory import ChatStore, get_chat_store
 from rag_sql.query_history import QueryHistory, get_query_history
 from rag_sql.retrieval import get_retriever
@@ -40,6 +40,17 @@ def route_after_execute(state: AgentState, max_retries: int) -> Literal["answer"
     return "generate_sql" if _should_retry(state, max_retries) else "answer"
 
 
+def default_query_runner(settings: Settings | None = None) -> Callable[[str], QueryResult]:
+    """Runs agent SQL as the read-only role, with the configured row limit and timeout."""
+    s = settings or get_settings()
+    return partial(
+        run_query,
+        get_engine("reader", settings=s),
+        row_limit=s.sql_row_limit,
+        timeout_ms=s.sql_timeout_ms,
+    )
+
+
 def build_graph(
     *,
     llm: BaseChatModel | None = None,
@@ -62,12 +73,7 @@ def build_graph(
     if query_history is None:
         query_history = get_query_history(s)
     if query_runner is None:
-        query_runner = partial(
-            run_query,
-            get_engine("reader", settings=s),
-            row_limit=s.sql_row_limit,
-            timeout_ms=s.sql_timeout_ms,
-        )
+        query_runner = default_query_runner(s)
 
     graph = StateGraph(AgentState)
     graph.add_node(
@@ -89,7 +95,9 @@ def build_graph(
     graph.add_node("validate_sql", partial(nodes.validate_sql, row_limit=s.sql_row_limit))
     graph.add_node("execute_sql", partial(nodes.execute_sql, run_query=query_runner))
     graph.add_node("answer", partial(nodes.answer, llm=llm))
-    graph.add_node("save_turn", partial(nodes.save_turn, store=chat_store))
+    graph.add_node(
+        "save_turn", partial(nodes.save_turn, store=chat_store, model=chat_model_name(llm))
+    )
     graph.add_node(
         "save_query_example", partial(nodes.save_query_example, query_history=query_history)
     )

@@ -75,13 +75,16 @@ def test_thread() -> Iterator[str]:
 
 def test_chat_store_round_trip(test_thread: str) -> None:
     store = get_chat_store()
-    store.append(test_thread, make_turn("first"))
+    first = make_turn(
+        "first",
+        sql_reasoning="Plan the SQL.",
+        answer_reasoning="Read the rows.",
+        model="qwen3.5:9b",
+    )
+    store.append(test_thread, first)
     store.append(test_thread, make_turn("second", sql=None, answer="failed"))
 
-    assert store.load(test_thread) == [
-        make_turn("first"),
-        make_turn("second", sql=None, answer="failed"),
-    ]
+    assert store.load(test_thread) == [first, make_turn("second", sql=None, answer="failed")]
     assert [t["question"] for t in store.load(test_thread, 1)] == ["second"]
     [summary] = [t for t in store.threads(limit=1000) if t.thread_id == test_thread]
     assert (summary.turns, summary.first_question) == (2, "first")

@@ -185,7 +185,8 @@ class Chat:
         if not turns:
             _muted("No questions in this conversation yet.")
             return
-        display(pd.DataFrame(turns))
+        # The thinking columns are long; the web UI shows them.
+        display(pd.DataFrame(turns).drop(columns=["sql_reasoning", "answer_reasoning"]))
 
 
 def show_threads(limit: int = 20, store: ChatStore | None = None) -> None:

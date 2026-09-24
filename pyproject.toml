@@ -22,11 +22,17 @@ dependencies = [
     "pandas>=2.2",
     "ipython>=8.0",
     "ipykernel>=7.3.0",
+    "ollama>=0.6",
 ]
 
 [project.scripts]
 rag-sql-index = "rag_sql.retrieval:main"
 rag-sql-history = "rag_sql.query_history:main"
+
+[project.optional-dependencies]
+web = [
+    "streamlit>=1.64.0",
+]
 
 [dependency-groups]
 dev = [

@@ -26,5 +26,36 @@ services:
       timeout: 5s
       retries: 5
 
+  # Streamlit chat UI (src/rag_sql/web.py). Rebuild after code changes: docker compose up -d --build
+  web:
+    build: .
+    image: rag-sql-web
+    container_name: rag-sql-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Inside the compose network, Postgres is the "postgres" service on its container port.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      # The UI only uses the read-only and chat roles, so it never gets admin credentials.
+      POSTGRES_USER: ""
+      POSTGRES_PASSWORD: ""
+    ports:
+      # This device only.
+      - "127.0.0.1:${WEB_PORT:-8501}:8501"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
 volumes:
   pgdata:

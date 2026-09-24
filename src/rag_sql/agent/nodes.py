@@ -239,7 +239,8 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
             "answer": (
                 f"I couldn't produce a working SQL query after {state.get('attempts', 0)} "
                 f"attempt(s). Last error: {state.get('error') or 'unknown'}"
-            )
+            ),
+            "answer_reasoning": None,
         }
 
     shown = min(result.row_count, ANSWER_MAX_ROWS)
@@ -259,12 +260,14 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
             "rows": format_rows(result),
         }
     )
-    _, content = split_reasoning(message)
-    return {"answer": content}
+    reasoning, content = split_reasoning(message)
+    return {"answer": content, "answer_reasoning": reasoning}
 
 
-def save_turn(state: AgentState, *, store: ChatStore) -> dict:
+def save_turn(state: AgentState, *, store: ChatStore, model: str | None = None) -> dict:
     """Append this turn to the history, and save it when the run has a thread_id.
+
+    `model` is the name of the chat model that answered, recorded with the turn.
 
     A failed save is logged, not raised: the answer has already been produced.
     """
@@ -276,6 +279,9 @@ def save_turn(state: AgentState, *, store: ChatStore) -> dict:
         "row_count": result.row_count if result is not None else None,
         "answer": state.get("answer", ""),
         "error": None if result is not None else state.get("error"),
+        "sql_reasoning": state.get("reasoning"),
+        "answer_reasoning": state.get("answer_reasoning"),
+        "model": model,
     }
     turn_id = None
     if thread_id := state.get("thread_id"):

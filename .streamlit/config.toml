@@ -1,0 +1,4 @@
+# Streamlit settings for the web UI (src/rag_sql/web.py), locally and in Docker.
+
+[browser]
+gatherUsageStats = false

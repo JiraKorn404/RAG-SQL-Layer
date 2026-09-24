@@ -22,5 +22,6 @@ class AgentState(TypedDict, total=False):
     attempts: int  # number of SQL generations so far
     result: QueryResult | None
     answer: str
+    answer_reasoning: str | None  # model thinking behind the answer, if the model produced any
     turn_id: int | None  # id of the saved chat turn
     example_saved: bool  # whether this turn was added to the query history

@@ -36,14 +36,25 @@ CREATE TABLE IF NOT EXISTS chat_memory.chat_turns (
     row_count   integer,
     answer      text        NOT NULL,
     error       text,
-    created_at  timestamptz NOT NULL DEFAULT now()
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    sql_reasoning    text,
+    answer_reasoning text,
+    model            text
 );
+-- Databases created before these columns existed get them here.
+ALTER TABLE chat_memory.chat_turns
+    ADD COLUMN IF NOT EXISTS sql_reasoning    text,
+    ADD COLUMN IF NOT EXISTS answer_reasoning text,
+    ADD COLUMN IF NOT EXISTS model            text;
 CREATE INDEX IF NOT EXISTS chat_turns_thread_idx ON chat_memory.chat_turns (thread_id, id);
 
 COMMENT ON TABLE chat_memory.chat_turns IS 'Agent chat history, one row per question. Append-only.';
 COMMENT ON COLUMN chat_memory.chat_turns.standalone IS 'Question rewritten to stand on its own, using earlier turns.';
 COMMENT ON COLUMN chat_memory.chat_turns.sql IS 'SQL that produced the answer; NULL when every attempt failed.';
 COMMENT ON COLUMN chat_memory.chat_turns.error IS 'Last validation or execution error when the turn failed.';
+COMMENT ON COLUMN chat_memory.chat_turns.sql_reasoning IS 'Model thinking behind the last SQL attempt; NULL when the model gave none.';
+COMMENT ON COLUMN chat_memory.chat_turns.answer_reasoning IS 'Model thinking behind the answer; NULL when the model gave none.';
+COMMENT ON COLUMN chat_memory.chat_turns.model IS 'Chat model that answered, e.g. qwen3.5:9b; NULL for turns saved before it was recorded.';
 
 -- Successful queries, searched by question similarity before the agent writes new SQL.
 -- `embedding` has no fixed dimension; searches only compare rows of the current embed_model.

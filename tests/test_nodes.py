@@ -96,7 +96,21 @@ def test_answer_uses_llm() -> None:
         "result": QueryResult(columns=["emp_name"], rows=[("Employee_1",)]),
     }
     assert nodes.answer(state, llm=fake_llm("Employee_1 earns the most.")) == {
-        "answer": "Employee_1 earns the most."
+        "answer": "Employee_1 earns the most.",
+        "answer_reasoning": None,
+    }
+
+
+def test_answer_keeps_reasoning() -> None:
+    state = {
+        "question": "Top earner?",
+        "sql": "SELECT 1",
+        "result": QueryResult(columns=["emp_name"], rows=[("Employee_1",)]),
+    }
+    reply = AIMessage(content="Employee_1.", additional_kwargs={"reasoning_content": "One row."})
+    assert nodes.answer(state, llm=fake_llm(reply)) == {
+        "answer": "Employee_1.",
+        "answer_reasoning": "One row.",
     }
 
 
@@ -158,8 +172,10 @@ def test_save_turn_appends_and_saves(chat_store) -> None:
         "sql": "SELECT 1",
         "result": QueryResult(columns=["a"], rows=[(1,), (2,)]),
         "answer": "Two rows.",
+        "reasoning": "Count them.",
+        "answer_reasoning": "Two.",
     }
-    update = nodes.save_turn(state, store=chat_store)
+    update = nodes.save_turn(state, store=chat_store, model="qwen3.5:9b")
     turn = {
         "question": "And?",
         "standalone": "Full question?",
@@ -167,6 +183,9 @@ def test_save_turn_appends_and_saves(chat_store) -> None:
         "row_count": 2,
         "answer": "Two rows.",
         "error": None,
+        "sql_reasoning": "Count them.",
+        "answer_reasoning": "Two.",
+        "model": "qwen3.5:9b",
     }
     assert update["history"] == [make_turn("q0"), turn]
     assert chat_store.load("t1") == [turn]

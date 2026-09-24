@@ -23,6 +23,9 @@ class Turn(TypedDict):
     row_count: int | None
     answer: str
     error: str | None  # last error when the turn failed
+    sql_reasoning: str | None  # model thinking behind the last SQL attempt, if any
+    answer_reasoning: str | None  # model thinking behind the answer, if any
+    model: str | None  # chat model that answered
 
 
 @dataclass(frozen=True)
@@ -93,7 +96,8 @@ class PostgresChatStore:
             rows = (
                 conn.execute(
                     text(
-                        "SELECT question, standalone, sql, row_count, answer, error "
+                        "SELECT question, standalone, sql, row_count, answer, error, "
+                        "sql_reasoning, answer_reasoning, model "
                         "FROM chat_memory.chat_turns WHERE thread_id = :thread_id "
                         "ORDER BY id DESC LIMIT :limit"
                     ),
@@ -109,8 +113,10 @@ class PostgresChatStore:
             return conn.execute(
                 text(
                     "INSERT INTO chat_memory.chat_turns "
-                    "(thread_id, question, standalone, sql, row_count, answer, error) VALUES "
-                    "(:thread_id, :question, :standalone, :sql, :row_count, :answer, :error) "
+                    "(thread_id, question, standalone, sql, row_count, answer, error, "
+                    "sql_reasoning, answer_reasoning, model) VALUES "
+                    "(:thread_id, :question, :standalone, :sql, :row_count, :answer, :error, "
+                    ":sql_reasoning, :answer_reasoning, :model) "
                     "RETURNING id"
                 ),
                 {"thread_id": thread_id, **turn},

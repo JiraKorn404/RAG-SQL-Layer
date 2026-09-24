@@ -1,8 +1,8 @@
 # RAG-SQL-Layer
 
-RAG text-to-SQL agent. Ask a question in natural language in a Jupyter notebook. The agent retrieves relevant schema context from pgvector, writes SQL with a self-hosted Ollama model, runs it read-only against PostgreSQL, and answers from the result. It shows its thinking, the SQL, and the query output along the way.
+RAG text-to-SQL agent. Ask a question in natural language in a Jupyter notebook or a Streamlit web chat. The agent retrieves relevant schema context from pgvector, writes SQL with a self-hosted Ollama model, runs it read-only against PostgreSQL, and answers from the result. It shows its thinking, the SQL, and the query output along the way.
 
-Stack: PostgreSQL 17 + pgvector (Docker) · Ollama over Tailscale (`langchain_ollama`) · LangGraph · Jupyter.
+Stack: PostgreSQL 17 + pgvector (Docker) · Ollama over Tailscale (`langchain_ollama`) · LangGraph · Jupyter · Streamlit (Docker).
 
 See [CLAUDE.md](CLAUDE.md) for architecture, module layout and conventions.
 
@@ -88,6 +88,24 @@ chat.ask("And the lowest?")  # rewritten to a standalone question using the hist
 chat.show_history()  # this conversation's saved turns
 show_threads()  # all saved conversations
 chat = Chat("<thread id>")  # continue one later, even after a restart
+```
+
+### Web UI
+
+`docker compose up -d` also starts a Streamlit chat at **http://localhost:8501**. It's reachable from this device only. Pick the chat model in the sidebar: it lists the chat models installed on your Ollama server (embedding models are left out) and starts on `OLLAMA_CHAT_MODEL`. Each reply names the model that answered, and it's saved with the conversation. The model's thinking streams in live, followed by the SQL, the result table and the answer. The sidebar lists saved conversations (the same ones as `show_threads()`), and **New chat** starts another. The open conversation is in the URL, so a page refresh keeps it.
+
+```sh
+docker compose up -d --build     # rebuild the web image after code changes
+docker compose logs -f web       # app logs
+```
+
+The web container uses only the read-only and chat roles. It never gets the admin password, and `.env` isn't copied into the image. To use another host port, set `WEB_PORT` in `.env`.
+
+To run it without Docker (from `.env`, with `POSTGRES_HOST=localhost`):
+
+```sh
+uv sync --extra web
+uv run streamlit run src/rag_sql/web.py
 ```
 
 ### Query history
