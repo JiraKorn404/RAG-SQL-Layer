@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     app_db_user: str = "rag_reader"
     app_db_password: SecretStr = SecretStr("")
 
+    # Chat history role: reads and inserts chat_memory.chat_turns, nothing else
+    chat_db_user: str = "rag_memory"
+    chat_db_password: SecretStr = SecretStr("")
+
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_chat_model: str = "qwen3:14b"
@@ -42,6 +46,9 @@ class Settings(BaseSettings):
     # Retrieval
     vector_collection: str = "schema_docs"
     retrieval_k: int = 6
+
+    # Chat history: earlier turns shown to the model (0 = none; turns are still saved)
+    chat_history_turns: int = 5
 
 
 @lru_cache

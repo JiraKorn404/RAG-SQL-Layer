@@ -11,15 +11,26 @@ from langchain_core.messages import BaseMessage
 from langchain_core.runnables import Runnable
 from sqlalchemy.exc import DBAPIError
 
-from rag_sql.agent.prompts import ANSWER_PROMPT, SQL_GENERATION_PROMPT, SQL_RETRY_FEEDBACK
+from rag_sql.agent.prompts import (
+    ANSWER_HISTORY,
+    ANSWER_PROMPT,
+    CONDENSE_PROMPT,
+    SQL_GENERATION_PROMPT,
+    SQL_HISTORY,
+    SQL_RETRY_FEEDBACK,
+)
 from rag_sql.agent.state import AgentState
 from rag_sql.db.query import QueryResult, SQLValidationError
 from rag_sql.db.query import validate_sql as check_sql
+from rag_sql.memory import ChatStore, Turn
 
 logger = logging.getLogger(__name__)
 
 # Rows of the SQL result shown to the model when writing the answer.
 ANSWER_MAX_ROWS = 50
+
+# Characters of each earlier answer shown to the model.
+HISTORY_ANSWER_CHARS = 500
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 _SQL_BLOCK_RE = re.compile(r"```sql\s*(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -85,11 +96,59 @@ def format_rows(result: QueryResult, max_rows: int = ANSWER_MAX_ROWS) -> str:
     return "\n".join(lines)
 
 
+def format_history(history: list[Turn], *, sql: bool = False, answers: bool = True) -> str:
+    """Earlier turns, oldest first: each question, plus its SQL and/or answer."""
+    blocks = []
+    for turn in history:
+        lines = [f"Question: {turn['standalone'] or turn['question']}"]
+        if sql:
+            if turn["sql"]:
+                lines.append(f"```sql\n{turn['sql']}\n```")
+            else:
+                lines.append(f"(no working SQL; error: {turn['error'] or 'unknown'})")
+        if answers:
+            text = turn["answer"]
+            if len(text) > HISTORY_ANSWER_CHARS:
+                text = text[:HISTORY_ANSWER_CHARS].rstrip() + " …"
+            lines.append(f"Answer: {text}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def current_question(state: AgentState) -> str:
+    """The question the SQL must answer: the standalone rewrite when there is one."""
+    return state.get("standalone_question") or state["question"]
+
+
 # --- nodes -----------------------------------------------------------------------------------
 
 
+def load_history(state: AgentState, *, store: ChatStore, max_turns: int) -> dict:
+    """Load the thread's last `max_turns` turns. Without a thread_id, keep any history passed in."""
+    if max_turns <= 0:
+        return {"history": []}
+    thread_id = state.get("thread_id")
+    if thread_id:
+        return {"history": store.load(thread_id, max_turns)}
+    return {"history": state.get("history", [])[-max_turns:]}
+
+
+def condense_question(state: AgentState, *, llm: BaseChatModel) -> dict:
+    """Rewrite a follow-up into a standalone question. No model call on the first turn."""
+    question = state["question"]
+    history = state.get("history") or []
+    if not history:
+        return {"standalone_question": question}
+
+    message = (CONDENSE_PROMPT | llm).invoke(
+        {"history": format_history(history), "question": question}
+    )
+    _, content = split_reasoning(message)
+    return {"standalone_question": content or question}
+
+
 def retrieve_context(state: AgentState, *, retriever: Runnable[str, list[Document]]) -> dict:
-    docs = retriever.invoke(state["question"])
+    docs = retriever.invoke(current_question(state))
     logger.debug("Retrieved %d docs", len(docs))
     return {"context": docs}
 
@@ -98,14 +157,20 @@ def generate_sql(state: AgentState, *, llm: BaseChatModel, row_limit: int) -> di
     feedback = ""
     if state.get("error") and state.get("sql") is not None:
         feedback = SQL_RETRY_FEEDBACK.format(sql=state["sql"], error=state["error"])
+    history = state.get("history") or []
 
     context = state.get("context", [])
     message = (SQL_GENERATION_PROMPT | llm).invoke(
         {
             "schema": format_schema(context),
             "examples": format_examples(context),
+            "history": (
+                SQL_HISTORY.format(turns=format_history(history, sql=True, answers=False))
+                if history
+                else ""
+            ),
             "feedback": feedback,
-            "question": state["question"],
+            "question": current_question(state),
             "row_limit": row_limit,
         }
     )
@@ -153,9 +218,11 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
     if result.truncated:
         row_summary += ", truncated at the row limit"
 
+    history = state.get("history") or []
     message = (ANSWER_PROMPT | llm).invoke(
         {
-            "question": state["question"],
+            "history": ANSWER_HISTORY.format(turns=format_history(history)) if history else "",
+            "question": current_question(state),
             "sql": state["sql"],
             "row_summary": row_summary,
             "rows": format_rows(result),
@@ -163,3 +230,25 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
     )
     _, content = split_reasoning(message)
     return {"answer": content}
+
+
+def save_turn(state: AgentState, *, store: ChatStore) -> dict:
+    """Append this turn to the history, and save it when the run has a thread_id.
+
+    A failed save is logged, not raised: the answer has already been produced.
+    """
+    result = state.get("result")
+    turn: Turn = {
+        "question": state["question"],
+        "standalone": current_question(state),
+        "sql": state.get("sql") if result is not None else None,
+        "row_count": result.row_count if result is not None else None,
+        "answer": state.get("answer", ""),
+        "error": None if result is not None else state.get("error"),
+    }
+    if thread_id := state.get("thread_id"):
+        try:
+            store.append(thread_id, turn)
+        except Exception:
+            logger.exception("Could not save the turn to chat history (thread %s)", thread_id)
+    return {"history": [*state.get("history", []), turn]}

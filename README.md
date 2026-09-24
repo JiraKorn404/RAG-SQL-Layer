@@ -20,7 +20,7 @@ See [CLAUDE.md](CLAUDE.md) for architecture, module layout and conventions.
 cp .env.example .env
 ```
 
-Edit `.env`. At minimum, set `POSTGRES_PASSWORD`, `APP_DB_PASSWORD` and `OLLAMA_BASE_URL`.
+Edit `.env`. At minimum, set `POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `CHAT_DB_PASSWORD` and `OLLAMA_BASE_URL`.
 
 ### 2. Start PostgreSQL
 
@@ -29,12 +29,14 @@ docker compose up -d
 docker compose ps          # wait for "healthy"
 ```
 
-On first start (empty volume), the scripts in `db/init/` enable pgvector and create the read-only role `APP_DB_USER`. The agent only ever connects as that role.
+On first start (empty volume), the scripts in `db/init/` enable pgvector, create the read-only role `APP_DB_USER`, and create the chat history table (`chat_memory.chat_turns`) with its own role `CHAT_DB_USER`. The agent's SQL only ever runs as the read-only role, which can't see chat history.
 
-If the database volume already existed before the role script was added, create the role manually (safe to re-run):
+If the database volume already existed before these scripts were added, run them manually (both are safe to re-run):
 
 ```sh
+docker compose up -d       # recreates the container if .env gained new keys
 docker compose exec postgres bash /docker-entrypoint-initdb.d/02-roles.sh
+docker compose exec postgres bash /docker-entrypoint-initdb.d/04-chat-memory.sh
 ```
 
 > Git Bash on Windows rewrites the container path. Prefix the command with `MSYS_NO_PATHCONV=1`, or run it from PowerShell.
@@ -70,7 +72,22 @@ uv run jupyter lab notebooks/demo.ipynb
 
 ```python
 from rag_sql.display import run_and_display
+
 run_and_display("Which department has the highest average salary?")
+```
+
+Follow-up questions go in a `Chat`, which keeps one conversation. Every question and answer is saved in Postgres and kept.
+
+```python
+from rag_sql.display import Chat, show_threads
+
+chat = Chat()
+chat.ask("Which department has the highest average salary?")
+chat.ask("And the lowest?")  # rewritten to a standalone question using the history
+
+chat.show_history()  # this conversation's saved turns
+show_threads()  # all saved conversations
+chat = Chat("<thread id>")  # continue one later, even after a restart
 ```
 
 ## Development

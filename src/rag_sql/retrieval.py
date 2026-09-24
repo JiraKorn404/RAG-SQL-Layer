@@ -85,7 +85,7 @@ def build_index(
     Returns the number of documents indexed.
     """
     s = settings or get_settings()
-    engine = engine or get_engine(readonly=False, settings=s)
+    engine = engine or get_engine("admin", settings=s)
     embeddings = embeddings or get_embeddings(s)
 
     tables = introspect_tables(engine)
@@ -112,7 +112,7 @@ def get_retriever(
     Uses the read-only engine; the index must already exist (`uv run rag-sql-index`).
     """
     s = settings or get_settings()
-    engine = engine or get_engine(readonly=True, settings=s)
+    engine = engine or get_engine("reader", settings=s)
     embeddings = embeddings or get_embeddings(s)
     k = k or s.retrieval_k
 

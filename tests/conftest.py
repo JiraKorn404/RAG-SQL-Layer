@@ -8,6 +8,7 @@ from langchain_core.runnables import RunnableLambda
 
 from rag_sql.config import Settings
 from rag_sql.db.query import QueryResult
+from rag_sql.memory import InMemoryChatStore, Turn
 
 TABLE_DOC = Document(
     page_content="Table employees\n  emp_name TEXT\n  salary NUMERIC(12, 2)",
@@ -36,6 +37,22 @@ def settings() -> Settings:
 @pytest.fixture
 def retriever() -> RunnableLambda:
     return RunnableLambda(lambda _question: [TABLE_DOC, EXAMPLE_DOC])
+
+
+@pytest.fixture
+def chat_store() -> InMemoryChatStore:
+    return InMemoryChatStore()
+
+
+def make_turn(question: str, sql: str | None = "SELECT 1", answer: str = "A.") -> Turn:
+    return {
+        "question": question,
+        "standalone": question,
+        "sql": sql,
+        "row_count": 1 if sql else None,
+        "answer": answer,
+        "error": None if sql else "boom",
+    }
 
 
 @pytest.fixture

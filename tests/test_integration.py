@@ -1,11 +1,16 @@
 """Tests against the real Postgres (and Ollama). Run with: uv run pytest -m integration"""
 
+from collections.abc import Iterator
+
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from rag_sql.db.connection import get_engine
 from rag_sql.db.introspect import introspect_tables
 from rag_sql.db.query import run_query, validate_sql
+from rag_sql.memory import get_chat_store, new_thread_id
+from tests.conftest import make_turn
 
 pytestmark = pytest.mark.integration
 
@@ -40,7 +45,7 @@ def test_percent_and_colon_literals_are_not_placeholders() -> None:
 
 
 def test_introspection_skips_vector_tables() -> None:
-    names = {t.name for t in introspect_tables(get_engine(readonly=False))}
+    names = {t.name for t in introspect_tables(get_engine("admin"))}
     assert "employees" in names
     assert not any(n.startswith("langchain_pg_") for n in names)
 
@@ -51,3 +56,59 @@ def test_end_to_end() -> None:
     state = build_graph().invoke({"question": "How many employees are there?"})
     assert state.get("result") is not None, state.get("error")
     assert state["answer"]
+
+
+# --- chat history ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def test_thread() -> Iterator[str]:
+    """A throwaway thread id; its rows are removed as admin (the chat role cannot delete)."""
+    thread_id = f"pytest-{new_thread_id()}"
+    yield thread_id
+    with get_engine("admin").begin() as conn:
+        conn.execute(
+            text("DELETE FROM chat_memory.chat_turns WHERE thread_id = :t"), {"t": thread_id}
+        )
+
+
+def test_chat_store_round_trip(test_thread: str) -> None:
+    store = get_chat_store()
+    store.append(test_thread, make_turn("first"))
+    store.append(test_thread, make_turn("second", sql=None, answer="failed"))
+
+    assert store.load(test_thread) == [
+        make_turn("first"),
+        make_turn("second", sql=None, answer="failed"),
+    ]
+    assert [t["question"] for t in store.load(test_thread, 1)] == ["second"]
+    [summary] = [t for t in store.threads(limit=1000) if t.thread_id == test_thread]
+    assert (summary.turns, summary.first_question) == (2, "first")
+
+
+def test_reader_role_cannot_read_chat_history() -> None:
+    with pytest.raises(DBAPIError, match="permission denied"):
+        run_query(
+            get_engine(), "SELECT * FROM chat_memory.chat_turns", row_limit=1, timeout_ms=2000
+        )
+
+
+def test_chat_role_cannot_read_agent_tables() -> None:
+    with (
+        pytest.raises(DBAPIError, match="permission denied"),
+        get_engine("memory").connect() as conn,
+    ):
+        conn.execute(text("SELECT 1 FROM employees LIMIT 1"))
+
+
+def test_chat_role_cannot_delete_history(test_thread: str) -> None:
+    get_chat_store().append(test_thread, make_turn("keep me"))
+    with pytest.raises(DBAPIError, match="permission denied"), get_engine("memory").begin() as conn:
+        conn.execute(
+            text("DELETE FROM chat_memory.chat_turns WHERE thread_id = :t"), {"t": test_thread}
+        )
+
+
+def test_introspection_skips_chat_history() -> None:
+    names = {t.qualified_name for t in introspect_tables(get_engine("admin"))}
+    assert not any("chat_turns" in n for n in names)

@@ -3,7 +3,8 @@ from sqlalchemy.exc import ProgrammingError
 
 from rag_sql.agent import nodes
 from rag_sql.db.query import QueryResult
-from tests.conftest import EXAMPLE_DOC, TABLE_DOC, fake_llm
+from rag_sql.memory import InMemoryChatStore
+from tests.conftest import EXAMPLE_DOC, TABLE_DOC, fake_llm, make_turn
 
 
 def test_extract_sql_prefers_sql_block() -> None:
@@ -95,3 +96,87 @@ def test_answer_uses_llm() -> None:
     assert nodes.answer(state, llm=fake_llm("Employee_1 earns the most.")) == {
         "answer": "Employee_1 earns the most."
     }
+
+
+# --- chat history ----------------------------------------------------------------------------
+
+
+def test_format_history_sql_and_answers() -> None:
+    history = [make_turn("q1", sql="SELECT 1", answer="a1"), make_turn("q2", sql=None)]
+    with_sql = nodes.format_history(history, sql=True, answers=False)
+    assert with_sql == (
+        "Question: q1\n```sql\nSELECT 1\n```\n\nQuestion: q2\n(no working SQL; error: boom)"
+    )
+    assert nodes.format_history(history[:1]) == "Question: q1\nAnswer: a1"
+
+
+def test_format_history_truncates_long_answers() -> None:
+    text = nodes.format_history([make_turn("q", answer="x" * 1000)])
+    assert text.endswith(" …")
+    assert len(text) < nodes.HISTORY_ANSWER_CHARS + 50
+
+
+def test_load_history_from_store(chat_store) -> None:
+    for i in range(4):
+        chat_store.append("t1", make_turn(f"q{i}"))
+    update = nodes.load_history({"thread_id": "t1"}, store=chat_store, max_turns=2)
+    assert [t["question"] for t in update["history"]] == ["q2", "q3"]
+
+
+def test_load_history_without_thread_keeps_passed_history(chat_store) -> None:
+    passed = [make_turn("a"), make_turn("b")]
+    update = nodes.load_history({"history": passed}, store=chat_store, max_turns=1)
+    assert [t["question"] for t in update["history"]] == ["b"]
+
+
+def test_load_history_disabled(chat_store) -> None:
+    chat_store.append("t1", make_turn("q"))
+    assert nodes.load_history({"thread_id": "t1"}, store=chat_store, max_turns=0) == {"history": []}
+
+
+def test_condense_question_skips_llm_without_history() -> None:
+    update = nodes.condense_question({"question": "q", "history": []}, llm=fake_llm())
+    assert update == {"standalone_question": "q"}
+
+
+def test_condense_question_rewrites_follow_up() -> None:
+    llm = fake_llm(AIMessage(content="<think>resolve it</think>\nLowest paid in Sales?"))
+    state = {"question": "And the lowest?", "history": [make_turn("Highest paid in Sales?")]}
+    assert nodes.condense_question(state, llm=llm) == {
+        "standalone_question": "Lowest paid in Sales?"
+    }
+
+
+def test_save_turn_appends_and_saves(chat_store) -> None:
+    state = {
+        "thread_id": "t1",
+        "history": [make_turn("q0")],
+        "question": "And?",
+        "standalone_question": "Full question?",
+        "sql": "SELECT 1",
+        "result": QueryResult(columns=["a"], rows=[(1,), (2,)]),
+        "answer": "Two rows.",
+    }
+    update = nodes.save_turn(state, store=chat_store)
+    turn = {
+        "question": "And?",
+        "standalone": "Full question?",
+        "sql": "SELECT 1",
+        "row_count": 2,
+        "answer": "Two rows.",
+        "error": None,
+    }
+    assert update["history"] == [make_turn("q0"), turn]
+    assert chat_store.load("t1") == [turn]
+
+
+def test_save_turn_failure_is_logged_not_raised(caplog) -> None:
+    class BrokenStore(InMemoryChatStore):
+        def append(self, thread_id, turn) -> None:
+            raise RuntimeError("db down")
+
+    state = {"thread_id": "t1", "question": "q", "sql": "bad", "error": "boom", "answer": "x"}
+    update = nodes.save_turn(state, store=BrokenStore())
+    assert update["history"][0]["sql"] is None
+    assert update["history"][0]["error"] == "boom"
+    assert "Could not save the turn" in caplog.text
