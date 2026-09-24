@@ -15,6 +15,7 @@ from rag_sql.agent.prompts import (
     ANSWER_HISTORY,
     ANSWER_PROMPT,
     CONDENSE_PROMPT,
+    SIMILAR_QUERIES,
     SQL_GENERATION_PROMPT,
     SQL_HISTORY,
     SQL_RETRY_FEEDBACK,
@@ -23,6 +24,7 @@ from rag_sql.agent.state import AgentState
 from rag_sql.db.query import QueryResult, SQLValidationError
 from rag_sql.db.query import validate_sql as check_sql
 from rag_sql.memory import ChatStore, Turn
+from rag_sql.query_history import PastQuery, QueryHistory, normalize_question
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,10 @@ def format_examples(context: list[Document]) -> str:
         if d.metadata.get("kind") == "example"
     ]
     return "\n\n".join(examples) or "(none)"
+
+
+def format_similar_queries(queries: list[PastQuery]) -> str:
+    return "\n\n".join(f"Question: {q.question}\n```sql\n{q.sql}\n```" for q in queries)
 
 
 def format_rows(result: QueryResult, max_rows: int = ANSWER_MAX_ROWS) -> str:
@@ -153,17 +159,42 @@ def retrieve_context(state: AgentState, *, retriever: Runnable[str, list[Documen
     return {"context": docs}
 
 
+def find_similar_queries(
+    state: AgentState, *, query_history: QueryHistory, k: int, min_similarity: float
+) -> dict:
+    """Similar past successful queries, minus ones already given as curated examples.
+
+    A failed search is logged and skipped: the agent still works without these examples.
+    """
+    try:
+        found = query_history.search(current_question(state), k, min_similarity)
+    except Exception:
+        logger.warning("Query history search failed; continuing without it", exc_info=True)
+        return {"similar_queries": []}
+
+    curated = {
+        normalize_question(d.page_content)
+        for d in state.get("context", [])
+        if d.metadata.get("kind") == "example"
+    }
+    return {"similar_queries": [q for q in found if normalize_question(q.question) not in curated]}
+
+
 def generate_sql(state: AgentState, *, llm: BaseChatModel, row_limit: int) -> dict:
     feedback = ""
     if state.get("error") and state.get("sql") is not None:
         feedback = SQL_RETRY_FEEDBACK.format(sql=state["sql"], error=state["error"])
     history = state.get("history") or []
+    similar = state.get("similar_queries") or []
 
     context = state.get("context", [])
     message = (SQL_GENERATION_PROMPT | llm).invoke(
         {
             "schema": format_schema(context),
             "examples": format_examples(context),
+            "similar": (
+                SIMILAR_QUERIES.format(queries=format_similar_queries(similar)) if similar else ""
+            ),
             "history": (
                 SQL_HISTORY.format(turns=format_history(history, sql=True, answers=False))
                 if history
@@ -246,9 +277,29 @@ def save_turn(state: AgentState, *, store: ChatStore) -> dict:
         "answer": state.get("answer", ""),
         "error": None if result is not None else state.get("error"),
     }
+    turn_id = None
     if thread_id := state.get("thread_id"):
         try:
-            store.append(thread_id, turn)
+            turn_id = store.append(thread_id, turn)
         except Exception:
             logger.exception("Could not save the turn to chat history (thread %s)", thread_id)
-    return {"history": [*state.get("history", []), turn]}
+    return {"history": [*state.get("history", []), turn], "turn_id": turn_id}
+
+
+def save_query_example(state: AgentState, *, query_history: QueryHistory) -> dict:
+    """Add the turn's SQL to the query history when it ran and returned rows.
+
+    Only for runs with a thread_id, like chat history. A failed save is logged, not raised.
+    """
+    result = state.get("result")
+    sql = state.get("sql")
+    if not state.get("thread_id") or result is None or result.row_count == 0 or not sql:
+        return {"example_saved": False}
+    try:
+        saved = query_history.add(
+            current_question(state), sql, result.row_count, turn_id=state.get("turn_id")
+        )
+    except Exception:
+        logger.exception("Could not save the query to query history")
+        saved = False
+    return {"example_saved": saved}

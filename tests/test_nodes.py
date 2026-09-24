@@ -1,10 +1,12 @@
+import pytest
 from langchain_core.messages import AIMessage
 from sqlalchemy.exc import ProgrammingError
 
 from rag_sql.agent import nodes
 from rag_sql.db.query import QueryResult
 from rag_sql.memory import InMemoryChatStore
-from tests.conftest import EXAMPLE_DOC, TABLE_DOC, fake_llm, make_turn
+from rag_sql.query_history import InMemoryQueryHistory, PastQuery
+from tests.conftest import EXAMPLE_DOC, TABLE_DOC, KeywordEmbeddings, fake_llm, make_turn
 
 
 def test_extract_sql_prefers_sql_block() -> None:
@@ -180,3 +182,81 @@ def test_save_turn_failure_is_logged_not_raised(caplog) -> None:
     assert update["history"][0]["sql"] is None
     assert update["history"][0]["error"] == "boom"
     assert "Could not save the turn" in caplog.text
+
+
+# --- query history ---------------------------------------------------------------------------
+
+
+def test_format_similar_queries() -> None:
+    queries = [PastQuery("q1", "SELECT 1", 0.9), PastQuery("q2", "SELECT 2", 0.8)]
+    assert nodes.format_similar_queries(queries) == (
+        "Question: q1\n```sql\nSELECT 1\n```\n\nQuestion: q2\n```sql\nSELECT 2\n```"
+    )
+
+
+def test_find_similar_queries_drops_curated_duplicates(query_history) -> None:
+    query_history.add("Average salary per department?", "SELECT 1", 3)
+    query_history.add(EXAMPLE_DOC.page_content, "SELECT 2", 5)  # same as the curated example
+    state = {"question": "average salary by department", "context": [TABLE_DOC, EXAMPLE_DOC]}
+    update = nodes.find_similar_queries(state, query_history=query_history, k=5, min_similarity=0.0)
+    assert [q.question for q in update["similar_queries"]] == ["Average salary per department?"]
+
+
+def test_find_similar_queries_uses_standalone_question(query_history) -> None:
+    query_history.add("Highest salary per city?", "SELECT 1", 3)
+    state = {"question": "And per city?", "standalone_question": "Highest salary per city?"}
+    update = nodes.find_similar_queries(state, query_history=query_history, k=5, min_similarity=0.9)
+    assert [q.sql for q in update["similar_queries"]] == ["SELECT 1"]
+
+
+def test_find_similar_queries_failure_is_skipped(caplog) -> None:
+    class Broken(InMemoryQueryHistory):
+        def search(self, question, k, min_similarity):
+            raise RuntimeError("db down")
+
+    update = nodes.find_similar_queries(
+        {"question": "q"}, query_history=Broken(KeywordEmbeddings()), k=5, min_similarity=0.5
+    )
+    assert update == {"similar_queries": []}
+    assert "Query history search failed" in caplog.text
+
+
+def _finished_state(**overrides) -> dict:
+    state = {
+        "thread_id": "t1",
+        "turn_id": 7,
+        "question": "And per city?",
+        "standalone_question": "Average salary per city?",
+        "sql": "SELECT city, avg(salary) FROM employees GROUP BY 1",
+        "result": QueryResult(columns=["city", "avg"], rows=[("Paris", 1)]),
+        "error": None,
+        "answer": "Paris: 1.",
+    }
+    return state | overrides
+
+
+def test_save_query_example_stores_standalone_question(query_history) -> None:
+    assert nodes.save_query_example(_finished_state(), query_history=query_history) == {
+        "example_saved": True
+    }
+    [found] = query_history.search("Average salary per city?", 5, 0.9)
+    assert found.sql == "SELECT city, avg(salary) FROM employees GROUP BY 1"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"thread_id": None},  # not a saved conversation
+        {"result": None, "error": "boom"},  # every attempt failed
+        {"result": QueryResult(columns=["city"])},  # no rows
+    ],
+)
+def test_save_query_example_skips_unsuccessful_turns(query_history, overrides) -> None:
+    state = _finished_state(**overrides)
+    assert nodes.save_query_example(state, query_history=query_history) == {"example_saved": False}
+    assert query_history.search("Average salary per city?", 5, 0.0) == []
+
+
+def test_save_turn_returns_turn_id(chat_store) -> None:
+    assert nodes.save_turn(_finished_state(), store=chat_store)["turn_id"] == 1
+    assert nodes.save_turn(_finished_state(thread_id=None), store=chat_store)["turn_id"] is None

@@ -90,6 +90,18 @@ show_threads()  # all saved conversations
 chat = Chat("<thread id>")  # continue one later, even after a restart
 ```
 
+### Query history
+
+Every query that runs and returns rows is saved with an embedding of its question. For each new question, the agent retrieves up to `QUERY_HISTORY_K` (default 5) similar past queries from pgvector and shows them to the model as extra examples. They appear in the notebook as "Similar past queries". Only matches with a similarity of at least `QUERY_HISTORY_MIN_SIMILARITY` (default 0.75) are used, so a new kind of question can get none.
+
+```sh
+uv run rag-sql-history backfill          # add successful questions already in chat history
+uv run rag-sql-history list --sql        # see what is stored, with ids
+uv run rag-sql-history disable 12 15     # a query ran but was wrong: stop using it (enable to undo)
+```
+
+Run `backfill` again after changing `OLLAMA_EMBED_MODEL`.
+
 ## Development
 
 ```sh

@@ -60,13 +60,13 @@ def _nodes_run(
     return order, state
 
 
-def test_happy_path(settings, retriever, ok_runner, chat_store) -> None:
+def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
     llm = fake_llm("```sql\nSELECT emp_name, salary FROM employees\n```", "Employee_1.")
     graph = build_graph(
         llm=llm,
         retriever=retriever,
         query_runner=ok_runner,
-        chat_store=chat_store,
+        **stores,
         settings=settings,
     )
     order, state = _nodes_run(graph, "Who earns the most?")
@@ -75,11 +75,13 @@ def test_happy_path(settings, retriever, ok_runner, chat_store) -> None:
         "load_history",
         "condense_question",
         "retrieve_context",
+        "find_similar_queries",
         "generate_sql",
         "validate_sql",
         "execute_sql",
         "answer",
         "save_turn",
+        "save_query_example",
     ]
     assert state["standalone_question"] == "Who earns the most?"
     assert state["sql"].rstrip().endswith("LIMIT 50")
@@ -89,9 +91,12 @@ def test_happy_path(settings, retriever, ok_runner, chat_store) -> None:
     # No thread_id: the turn is returned in state but not saved.
     assert [t["answer"] for t in state["history"]] == ["Employee_1."]
     assert chat_store.threads() == []
+    assert state["example_saved"] is False
 
 
-def test_retries_after_invalid_then_db_error(settings, retriever, ok_runner, chat_store) -> None:
+def test_retries_after_invalid_then_db_error(
+    settings, retriever, ok_runner, chat_store, stores
+) -> None:
     calls = []
 
     def runner(sql: str) -> QueryResult:
@@ -110,25 +115,25 @@ def test_retries_after_invalid_then_db_error(settings, retriever, ok_runner, cha
         llm=llm,
         retriever=retriever,
         query_runner=runner,
-        chat_store=chat_store,
+        **stores,
         settings=settings,
     )
     order, state = _nodes_run(graph, "q")
 
     assert order.count("generate_sql") == 3
-    assert order[-2:] == ["answer", "save_turn"]
+    assert order[-3:] == ["answer", "save_turn", "save_query_example"]
     assert state["attempts"] == 3
     assert state["error"] is None
     assert state["answer"] == "Done."
 
 
-def test_gives_up_after_max_retries(settings, retriever, ok_runner, chat_store) -> None:
+def test_gives_up_after_max_retries(settings, retriever, ok_runner, chat_store, stores) -> None:
     llm = fake_llm(*["DROP TABLE employees"] * 3)
     graph = build_graph(
         llm=llm,
         retriever=retriever,
         query_runner=ok_runner,
-        chat_store=chat_store,
+        **stores,
         settings=settings,
     )
     order, state = _nodes_run(graph, "q", thread_id="t1")
@@ -142,7 +147,7 @@ def test_gives_up_after_max_retries(settings, retriever, ok_runner, chat_store) 
     assert "Only SELECT" in saved["error"]
 
 
-def test_follow_up_uses_history(settings, ok_runner, chat_store) -> None:
+def test_follow_up_uses_history(settings, ok_runner, chat_store, stores) -> None:
     retrieved_for: list[str] = []
 
     def retrieve(question: str) -> list:
@@ -162,7 +167,7 @@ def test_follow_up_uses_history(settings, ok_runner, chat_store) -> None:
         llm=llm,
         retriever=RunnableLambda(retrieve),
         query_runner=ok_runner,
-        chat_store=chat_store,
+        **stores,
         settings=settings,
     )
     recorder = PromptRecorder()
@@ -191,13 +196,13 @@ def test_follow_up_uses_history(settings, ok_runner, chat_store) -> None:
     assert saved[1]["answer"] == "HR has the lowest."
 
 
-def test_threads_are_isolated(settings, retriever, ok_runner, chat_store) -> None:
+def test_threads_are_isolated(settings, retriever, ok_runner, chat_store, stores) -> None:
     llm = fake_llm("SELECT 1", "One.", "SELECT 2", "Two.")
     graph = build_graph(
         llm=llm,
         retriever=retriever,
         query_runner=ok_runner,
-        chat_store=chat_store,
+        **stores,
         settings=settings,
     )
     _nodes_run(graph, "first", "a")
@@ -208,3 +213,43 @@ def test_threads_are_isolated(settings, retriever, ok_runner, chat_store) -> Non
     assert [t["question"] for t in state["history"]] == ["second"]
     assert [t["question"] for t in chat_store.load("a")] == ["first"]
     assert [t["question"] for t in chat_store.load("b")] == ["second"]
+
+
+def test_past_query_is_retrieved_in_another_thread(settings, retriever, ok_runner, stores) -> None:
+    llm = fake_llm(
+        "```sql\nSELECT department, avg(salary) AS avg_salary FROM employees GROUP BY 1\n```",
+        "Per department.",
+        "```sql\nSELECT 1\n```",
+        "Done.",
+    )
+    graph = build_graph(
+        llm=llm, retriever=retriever, query_runner=ok_runner, settings=settings, **stores
+    )
+    recorder = PromptRecorder()
+
+    _, first = _nodes_run(graph, "What is the average salary per department?", "a")
+    assert first["example_saved"] is True
+    order, second = _nodes_run(graph, "Average salary by department?", "b", [recorder])
+
+    assert order.index("find_similar_queries") == order.index("retrieve_context") + 1
+    [similar] = second["similar_queries"]
+    assert similar.question == "What is the average salary per department?"
+    assert similar.similarity == pytest.approx(1.0, abs=1e-3)
+    sql_prompt = recorder.prompts[0]  # new thread: no condense call
+    assert "Similar questions answered earlier" in sql_prompt
+    assert "AS avg_salary" in sql_prompt
+
+
+def test_empty_result_is_not_saved_as_example(settings, retriever, stores, query_history) -> None:
+    llm = fake_llm("SELECT 1", "Nothing found.")
+    graph = build_graph(
+        llm=llm,
+        retriever=retriever,
+        query_runner=lambda _sql: QueryResult(columns=["a"]),
+        settings=settings,
+        **stores,
+    )
+    _, state = _nodes_run(graph, "Average salary of remote employees?", "a")
+
+    assert state["example_saved"] is False
+    assert query_history.search("Average salary of remote employees?", 5, 0.0) == []

@@ -38,7 +38,9 @@ class ChatStore(Protocol):
         """The last `limit` turns of a thread (all of them when None), oldest first."""
         ...
 
-    def append(self, thread_id: str, turn: Turn) -> None: ...
+    def append(self, thread_id: str, turn: Turn) -> int:
+        """Save a turn and return its id."""
+        ...
 
     def threads(self, limit: int = 20) -> list[ThreadSummary]:
         """Conversations, most recently active first."""
@@ -60,12 +62,15 @@ class InMemoryChatStore:
 
     def __init__(self) -> None:
         self._rows: dict[str, list[tuple[datetime, Turn]]] = {}
+        self._count = 0
 
     def load(self, thread_id: str, limit: int | None = None) -> list[Turn]:
         return _last([turn.copy() for _, turn in self._rows.get(thread_id, [])], limit)
 
-    def append(self, thread_id: str, turn: Turn) -> None:
+    def append(self, thread_id: str, turn: Turn) -> int:
         self._rows.setdefault(thread_id, []).append((datetime.now(UTC), turn.copy()))
+        self._count += 1
+        return self._count
 
     def threads(self, limit: int = 20) -> list[ThreadSummary]:
         summaries = [
@@ -99,16 +104,17 @@ class PostgresChatStore:
             )
         return [Turn(**row) for row in reversed(rows)]
 
-    def append(self, thread_id: str, turn: Turn) -> None:
+    def append(self, thread_id: str, turn: Turn) -> int:
         with self._engine.begin() as conn:
-            conn.execute(
+            return conn.execute(
                 text(
                     "INSERT INTO chat_memory.chat_turns "
                     "(thread_id, question, standalone, sql, row_count, answer, error) VALUES "
-                    "(:thread_id, :question, :standalone, :sql, :row_count, :answer, :error)"
+                    "(:thread_id, :question, :standalone, :sql, :row_count, :answer, :error) "
+                    "RETURNING id"
                 ),
                 {"thread_id": thread_id, **turn},
-            )
+            ).scalar_one()
 
     def threads(self, limit: int = 20) -> list[ThreadSummary]:
         with self._engine.connect() as conn:

@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # Chat history: earlier turns shown to the model (0 = none; turns are still saved)
     chat_history_turns: int = 5
 
+    # Query history: similar past successful queries given to the model as examples
+    query_history_k: int = 5  # most retrieved (0 = off; queries are still saved)
+    query_history_min_similarity: float = 0.75  # cosine similarity cutoff
+
 
 @lru_cache
 def get_settings() -> Settings:

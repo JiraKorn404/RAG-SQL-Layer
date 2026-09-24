@@ -12,6 +12,11 @@ def test_in_memory_store_load_order_and_limit() -> None:
     assert store.load("missing") == []
 
 
+def test_in_memory_store_append_returns_ids() -> None:
+    store = InMemoryChatStore()
+    assert [store.append("t", make_turn(q)) for q in ("a", "b")] == [1, 2]
+
+
 def test_in_memory_store_returns_copies() -> None:
     store = InMemoryChatStore()
     turn = make_turn("a")

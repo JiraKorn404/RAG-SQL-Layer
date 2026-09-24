@@ -12,6 +12,7 @@ from rag_sql.agent.graph import build_graph
 from rag_sql.config import get_settings
 from rag_sql.db.query import QueryResult
 from rag_sql.memory import ChatStore, get_chat_store, new_thread_id
+from rag_sql.query_history import PastQuery
 
 # Rows rendered in the notebook table; the full result stays in the returned state.
 DISPLAY_MAX_ROWS = 50
@@ -50,6 +51,24 @@ def _show_context(update: dict[str, Any]) -> None:
     tables = [d.metadata.get("table") for d in docs if d.metadata.get("kind") == "table"]
     examples = sum(1 for d in docs if d.metadata.get("kind") == "example")
     _muted(f"Context: tables {html.escape(', '.join(tables) or 'none')} · {examples} example(s)")
+
+
+def _show_similar(update: dict[str, Any]) -> None:
+    queries: list[PastQuery] = update.get("similar_queries") or []
+    if not queries:
+        return
+    items = "".join(
+        f'<li style="margin-bottom:6px">{html.escape(q.question)} '
+        f"<span>(similarity {q.similarity:.2f})</span>"
+        f'<pre style="white-space:pre-wrap;margin:2px 0">{html.escape(q.sql)}</pre></li>'
+        for q in queries
+    )
+    display(
+        HTML(
+            f'<details style="{_MUTED}font-size:0.9em"><summary>Similar past queries '
+            f"({len(queries)})</summary><ol>{items}</ol></details>"
+        )
+    )
 
 
 def _show_generation(update: dict[str, Any]) -> None:
@@ -117,6 +136,8 @@ def run_and_display(
                 _show_condensed(question, update)
             elif node == "retrieve_context":
                 _show_context(update)
+            elif node == "find_similar_queries":
+                _show_similar(update)
             elif node == "generate_sql":
                 _show_generation(update)
             elif node in ("validate_sql", "execute_sql") and update.get("error"):
@@ -125,6 +146,8 @@ def run_and_display(
                 _show_result(update["result"])
             elif node == "answer":
                 display(Markdown(f"### Answer\n{update.get('answer', '')}"))
+            elif node == "save_query_example" and update.get("example_saved"):
+                _muted("Saved to query history as an example for similar questions.")
 
 
 class Chat:

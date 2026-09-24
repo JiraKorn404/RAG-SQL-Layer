@@ -10,7 +10,8 @@ from rag_sql.db.connection import get_engine
 from rag_sql.db.introspect import introspect_tables
 from rag_sql.db.query import run_query, validate_sql
 from rag_sql.memory import get_chat_store, new_thread_id
-from tests.conftest import make_turn
+from rag_sql.query_history import PostgresQueryHistory, list_examples, set_enabled
+from tests.conftest import KeywordEmbeddings, make_turn
 
 pytestmark = pytest.mark.integration
 
@@ -112,3 +113,78 @@ def test_chat_role_cannot_delete_history(test_thread: str) -> None:
 def test_introspection_skips_chat_history() -> None:
     names = {t.qualified_name for t in introspect_tables(get_engine("admin"))}
     assert not any("chat_turns" in n for n in names)
+
+
+# --- query history ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pg_history() -> Iterator[PostgresQueryHistory]:
+    """Query history under a throwaway embedding model name; its rows are removed as admin."""
+    model = f"pytest-{new_thread_id()}"
+    yield PostgresQueryHistory(get_engine("memory"), KeywordEmbeddings(), embed_model=model)
+    with get_engine("admin").begin() as conn:
+        conn.execute(
+            text("DELETE FROM chat_memory.query_examples WHERE embed_model = :m"), {"m": model}
+        )
+
+
+def test_query_history_round_trip(pg_history: PostgresQueryHistory, test_thread: str) -> None:
+    turn_id = get_chat_store().append(test_thread, make_turn("Average salary per department?"))
+    assert pg_history.add("Average salary per department?", "SELECT 1", 4, turn_id=turn_id)
+    assert pg_history.add("Highest salary per city?", "SELECT 2", 9)
+    assert not pg_history.add("Average salary per department?", "SELECT 1", 4)  # duplicate
+
+    found = pg_history.search("average salary by department", k=5, min_similarity=0.3)
+    assert [q.sql for q in found][:2] == ["SELECT 1", "SELECT 2"]
+    assert found[0].similarity == pytest.approx(1.0, abs=1e-3)
+    assert [q.sql for q in pg_history.search("average salary department", 5, 0.9)] == ["SELECT 1"]
+
+
+def test_query_history_ignores_other_embedding_models(pg_history: PostgresQueryHistory) -> None:
+    pg_history.add("Average salary per department?", "SELECT 1", 4)
+    other = PostgresQueryHistory(get_engine("memory"), KeywordEmbeddings(), embed_model="other")
+    assert other.search("Average salary per department?", 5, 0.0) == []
+
+
+def test_disabled_example_is_hidden_and_not_re_added(pg_history: PostgresQueryHistory) -> None:
+    pg_history.add("Average salary per department?", "SELECT 1", 4)
+    [stored] = [
+        e
+        for e in list_examples(get_engine("memory"), limit=1000)
+        if e.question == "Average salary per department?"
+        and e.embed_model == pg_history._embed_model
+    ]
+    assert set_enabled(get_engine("admin"), [stored.id], enabled=False) == 1
+    try:
+        assert pg_history.search("Average salary per department?", 5, 0.0) == []
+        assert not pg_history.add("Average salary per department?", "SELECT 1", 4)
+    finally:
+        set_enabled(get_engine("admin"), [stored.id], enabled=True)
+    assert pg_history.search("Average salary per department?", 5, 0.0)[0].sql == "SELECT 1"
+
+
+def test_backfill_adds_successful_turns_only(
+    pg_history: PostgresQueryHistory, test_thread: str
+) -> None:
+    store = get_chat_store()
+    store.append(test_thread, make_turn("Remote employees per city?", sql="SELECT 7"))
+    store.append(test_thread, make_turn("Broken question about salary?", sql=None))
+
+    assert pg_history.backfill() >= 1
+    assert pg_history.backfill() == 0  # nothing left for this model
+    sqls = [q.sql for q in pg_history.search("Remote employees per city?", 5, 0.99)]
+    assert "SELECT 7" in sqls
+    assert not pg_history.search("Broken question about salary?", 5, 0.99)
+
+
+def test_reader_role_cannot_read_query_history() -> None:
+    with pytest.raises(DBAPIError, match="permission denied"):
+        run_query(
+            get_engine(), "SELECT * FROM chat_memory.query_examples", row_limit=1, timeout_ms=2000
+        )
+
+
+def test_chat_role_cannot_enable_or_disable_examples() -> None:
+    with pytest.raises(DBAPIError, match="permission denied"):
+        set_enabled(get_engine("memory"), [1], enabled=False)

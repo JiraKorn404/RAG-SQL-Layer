@@ -46,11 +46,18 @@ SQL_GENERATION_PROMPT = ChatPromptTemplate.from_messages(
             "human",
             "Database schema:\n{schema}\n\n"
             "Example questions with correct SQL:\n{examples}\n\n"
+            "{similar}"
             "{history}"
             "{feedback}"
             "Question: {question}",
         ),
     ]
+)
+
+# Filled into {similar} of SQL_GENERATION_PROMPT when similar past queries were found.
+SIMILAR_QUERIES = (
+    "Similar questions answered earlier, with SQL that ran successfully "
+    "(check it fits this question before reusing it):\n{queries}\n\n"
 )
 
 # Filled into {history} of SQL_GENERATION_PROMPT when the conversation has earlier turns.

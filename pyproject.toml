@@ -26,6 +26,7 @@ dependencies = [
 
 [project.scripts]
 rag-sql-index = "rag_sql.retrieval:main"
+rag-sql-history = "rag_sql.query_history:main"
 
 [dependency-groups]
 dev = [

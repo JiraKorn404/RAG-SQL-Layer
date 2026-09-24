@@ -17,6 +17,7 @@ from rag_sql.db.connection import get_engine
 from rag_sql.db.query import QueryResult, run_query
 from rag_sql.llm import get_chat_model
 from rag_sql.memory import ChatStore, get_chat_store
+from rag_sql.query_history import QueryHistory, get_query_history
 from rag_sql.retrieval import get_retriever
 
 
@@ -45,11 +46,12 @@ def build_graph(
     retriever: Runnable[str, list[Document]] | None = None,
     query_runner: Callable[[str], QueryResult] | None = None,
     chat_store: ChatStore | None = None,
+    query_history: QueryHistory | None = None,
     settings: Settings | None = None,
 ) -> CompiledStateGraph:
     """Compile the agent graph. Pass fakes for any dependency to run without network or DB.
 
-    Chat history is loaded and saved only for runs whose input has a `thread_id`.
+    Chat history and query history are saved only for runs whose input has a `thread_id`.
     """
     s = settings or get_settings()
 
@@ -57,6 +59,8 @@ def build_graph(
     retriever = retriever or get_retriever(s)
     if chat_store is None:
         chat_store = get_chat_store(s)
+    if query_history is None:
+        query_history = get_query_history(s)
     if query_runner is None:
         query_runner = partial(
             run_query,
@@ -72,16 +76,29 @@ def build_graph(
     )
     graph.add_node("condense_question", partial(nodes.condense_question, llm=llm))
     graph.add_node("retrieve_context", partial(nodes.retrieve_context, retriever=retriever))
+    graph.add_node(
+        "find_similar_queries",
+        partial(
+            nodes.find_similar_queries,
+            query_history=query_history,
+            k=s.query_history_k,
+            min_similarity=s.query_history_min_similarity,
+        ),
+    )
     graph.add_node("generate_sql", partial(nodes.generate_sql, llm=llm, row_limit=s.sql_row_limit))
     graph.add_node("validate_sql", partial(nodes.validate_sql, row_limit=s.sql_row_limit))
     graph.add_node("execute_sql", partial(nodes.execute_sql, run_query=query_runner))
     graph.add_node("answer", partial(nodes.answer, llm=llm))
     graph.add_node("save_turn", partial(nodes.save_turn, store=chat_store))
+    graph.add_node(
+        "save_query_example", partial(nodes.save_query_example, query_history=query_history)
+    )
 
     graph.add_edge(START, "load_history")
     graph.add_edge("load_history", "condense_question")
     graph.add_edge("condense_question", "retrieve_context")
-    graph.add_edge("retrieve_context", "generate_sql")
+    graph.add_edge("retrieve_context", "find_similar_queries")
+    graph.add_edge("find_similar_queries", "generate_sql")
     graph.add_edge("generate_sql", "validate_sql")
     graph.add_conditional_edges(
         "validate_sql",
@@ -94,5 +111,6 @@ def build_graph(
         ["answer", "generate_sql"],
     )
     graph.add_edge("answer", "save_turn")
-    graph.add_edge("save_turn", END)
+    graph.add_edge("save_turn", "save_query_example")
+    graph.add_edge("save_query_example", END)
     return graph.compile()
