@@ -18,10 +18,9 @@ dependencies = [
     # Config
     "pydantic-settings>=2.6",
     "pyyaml>=6.0",
-    # Notebook display
+    # Result tables (notebook and web UI)
     "pandas>=2.2",
-    "ipython>=8.0",
-    "ipykernel>=7.3.0",
+    # Ollama client, for listing models (llm.py)
     "ollama>=0.6",
 ]
 
@@ -30,14 +29,20 @@ rag-sql-index = "rag_sql.retrieval:main"
 rag-sql-history = "rag_sql.query_history:main"
 
 [project.optional-dependencies]
+# Streamlit chat UI (web.py); the only extra installed in the Docker image.
 web = [
     "streamlit>=1.64.0",
+]
+# Notebook rendering (display.py). The dev group has JupyterLab, which includes it.
+notebook = [
+    "ipython>=9.17.1",
 ]
 
 [dependency-groups]
 dev = [
     "ipykernel>=6.29",
     "jupyterlab>=4.2",
+    "nbstripout>=0.9.1",
     "pytest>=8.3",
     "ruff>=0.8",
 ]

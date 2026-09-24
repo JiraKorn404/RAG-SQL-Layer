@@ -6,20 +6,27 @@ Run with `uv run streamlit run src/rag_sql/web.py`, or in Docker (the compose se
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
-import pandas as pd
 import streamlit as st
 from langchain_core.messages import BaseMessage
 from langgraph.graph.state import CompiledStateGraph
 
 from rag_sql.agent.graph import build_graph, default_query_runner
+from rag_sql.agent.nodes import turn_from_state
 from rag_sql.config import Settings, get_settings
 from rag_sql.llm import ChatModelInfo, get_chat_model, list_chat_models
 from rag_sql.memory import ChatStore, ThreadSummary, Turn, get_chat_store, new_thread_id
-from rag_sql.query_history import PastQuery, get_query_history
+from rag_sql.query_history import get_query_history
 from rag_sql.retrieval import get_retriever
+from rag_sql.steps import (
+    Step,
+    escape_md,
+    model_step,
+    steps_from_turn,
+    steps_from_update,
+    thinking_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,85 +51,11 @@ SIDEBAR_CSS = """
 # Seconds between redraws of streamed text; redrawing on every token slows the page down.
 REDRAW_INTERVAL = 0.1
 
-StepKind = Literal["caption", "similar", "thinking", "sql", "error", "result", "answer"]
+# Saved as the error of a turn that a new question stopped before it finished.
+INTERRUPTED = "Interrupted: a new question was sent before this one finished."
 
 
-@dataclass
-class Step:
-    """One element of an assistant reply. Kept in session state so reruns can redraw the chat."""
-
-    kind: StepKind
-    text: str = ""
-    label: str = ""
-    data: Any = None  # "similar": list[PastQuery]; "result": pandas.DataFrame
-
-
-# --- pure mapping from graph output to steps (no Streamlit calls) ------------------------------
-
-
-def thinking_label(node: str, attempt: int) -> str:
-    if node == "answer":
-        return "Thinking (answer)"
-    return "Thinking" if attempt <= 1 else f"Thinking (attempt {attempt})"
-
-
-def steps_from_update(
-    node: str, update: dict[str, Any], *, question: str, attempts: int, max_retries: int
-) -> list[Step]:
-    """The steps to show for one node's update from `graph.stream(stream_mode="updates")`."""
-    if node == "load_history":
-        earlier = len(update.get("history") or [])
-        return [Step("caption", f"{earlier} earlier question(s) in context")] if earlier else []
-    if node == "condense_question":
-        standalone = update.get("standalone_question") or ""
-        if standalone.strip() != question.strip():
-            return [Step("caption", f"Interpreted as: *{escape_md(standalone)}*")]
-        return []
-    if node == "retrieve_context":
-        docs = update.get("context") or []
-        tables = [d.metadata.get("table") for d in docs if d.metadata.get("kind") == "table"]
-        examples = sum(1 for d in docs if d.metadata.get("kind") == "example")
-        return [
-            Step(
-                "caption", f"Context: tables {', '.join(tables) or 'none'} · {examples} example(s)"
-            )
-        ]
-    if node == "find_similar_queries":
-        queries: list[PastQuery] = update.get("similar_queries") or []
-        if not queries:
-            return []
-        return [Step("similar", label=f"Similar past queries ({len(queries)})", data=queries)]
-    if node == "generate_sql":
-        attempt = update.get("attempts", 1)
-        steps = []
-        if reasoning := update.get("reasoning"):
-            steps.append(Step("thinking", reasoning, label=thinking_label(node, attempt)))
-        label = "SQL" if attempt <= 1 else f"SQL (attempt {attempt})"
-        return [*steps, Step("sql", update.get("sql") or "", label=label)]
-    if node in ("validate_sql", "execute_sql") and update.get("error"):
-        step = "Validation" if node == "validate_sql" else "Execution"
-        retry = (
-            f"retry {attempts} of {max_retries}" if attempts <= max_retries else "no retries left"
-        )
-        return [Step("error", update["error"], label=f"{step} error · {retry}")]
-    if node == "execute_sql" and (result := update.get("result")) is not None:
-        note = f"{result.row_count} row(s)"
-        if result.truncated:
-            note += " (truncated at the row limit)"
-        frame = pd.DataFrame.from_records(result.rows, columns=result.columns)
-        return [Step("result", note, data=frame)]
-    if node == "answer":
-        steps = []
-        if reasoning := update.get("answer_reasoning"):
-            steps.append(Step("thinking", reasoning, label=thinking_label(node, attempts)))
-        return [*steps, Step("answer", update.get("answer", ""))]
-    if node == "save_query_example" and update.get("example_saved"):
-        return [Step("caption", "Saved to query history as an example for similar questions.")]
-    return []
-
-
-def model_step(model: str) -> Step:
-    return Step("caption", f"Model `{model}`")
+# --- rendering ----------------------------------------------------------------------------------
 
 
 def model_label(model: ChatModelInfo) -> str:
@@ -135,42 +68,19 @@ def model_label(model: ChatModelInfo) -> str:
     return " · ".join(parts)
 
 
-def steps_from_turn(turn: Turn) -> list[Step]:
-    """Steps for a saved turn. Result rows aren't saved, so only the row count is shown."""
-    steps = [model_step(turn["model"])] if turn["model"] else []
-    if turn["standalone"].strip() != turn["question"].strip():
-        steps.append(Step("caption", f"Interpreted as: *{escape_md(turn['standalone'])}*"))
-    if turn["sql_reasoning"]:
-        steps.append(Step("thinking", turn["sql_reasoning"], label="Thinking"))
-    if turn["sql"]:
-        steps.append(Step("sql", turn["sql"], label="SQL"))
-    if turn["row_count"] is not None:
-        steps.append(Step("caption", f"{turn['row_count']} row(s) · result rows aren't saved"))
-    if turn["error"]:
-        steps.append(Step("error", turn["error"], label="Error"))
-    if turn["answer_reasoning"]:
-        steps.append(Step("thinking", turn["answer_reasoning"], label="Thinking (answer)"))
-    steps.append(Step("answer", turn["answer"]))
-    return steps
-
-
-def escape_md(text: str) -> str:
-    """Keep `$` literal: Streamlit Markdown renders `$...$` as LaTeX (e.g. two dollar amounts)."""
-    return text.replace("$", r"\$")
-
-
 def thread_title(thread: ThreadSummary) -> str:
     """The first question on one line. The sidebar cuts it to the button width with "…"."""
     return escape_md(" ".join(thread.first_question.split()))
 
 
-# --- rendering ----------------------------------------------------------------------------------
-
-
 def render_step(step: Step) -> None:
     match step.kind:
         case "caption":
-            st.caption(step.text)
+            st.caption(escape_md(step.text))
+        case "interpreted":
+            st.caption(f"Interpreted as: *{escape_md(step.text)}*")
+        case "model":
+            st.caption(f"Model `{step.text}`")
         case "similar":
             with st.expander(step.label, icon=":material/history:"):
                 for q in step.data:
@@ -226,6 +136,15 @@ class LiveCall:
             self._answer.markdown(escape_md(self.content))
         self._drawn_at = time.monotonic()
 
+    def streamed_steps(self) -> list[Step]:
+        """What was streamed so far, as steps. Makes no Streamlit calls."""
+        steps = []
+        if self.reasoning:
+            steps.append(Step("thinking", self.reasoning.strip(), label=self.label))
+        if self.content:
+            steps.append(Step("answer", self.content.strip()))
+        return steps
+
     def finish(self, steps: list[Step], *, failed: bool = False) -> tuple[list[Step], list[Step]]:
         """Close the live widgets once the node's update arrived.
 
@@ -251,15 +170,40 @@ class LiveCall:
         return keep, pending
 
 
+def unfinished_turn(state: dict[str, Any], error: str, live: LiveCall | None) -> Turn:
+    """The turn for a run that stopped before save_turn, with what it produced so far."""
+    turn = turn_from_state(state)
+    turn["error"] = error
+    if live is not None and live.node == "generate_sql" and live.reasoning:
+        turn["sql_reasoning"] = live.reasoning.strip()
+    if live is not None and live.node == "answer":
+        turn["answer"] = live.content.strip()
+        turn["answer_reasoning"] = live.reasoning.strip() or None
+    return turn
+
+
 def run_turn(
-    graph: CompiledStateGraph, question: str, thread_id: str, steps: list[Step], max_retries: int
+    graph: CompiledStateGraph,
+    question: str,
+    thread_id: str,
+    steps: list[Step],
+    max_retries: int,
+    *,
+    save_unfinished: Callable[[Turn], None] | None = None,
 ) -> None:
     """Run the agent on `question`, rendering as it goes and appending to `steps`.
 
-    `steps` is filled in place, so a run cut short by a new question keeps what it showed.
+    `steps` is filled in place, so a run cut short by a new question keeps what it showed. A run
+    that doesn't reach save_turn, because it failed or a new question stopped it, is passed to
+    `save_unfinished` with its error, so the saved conversation matches what was shown.
     """
     attempts = 0
     live: LiveCall | None = None
+    state: dict[str, Any] = {"question": question, "thread_id": thread_id}
+    saved = False
+    # Streamlit stops a run for a new question by raising a BaseException in it (RerunException),
+    # which `except Exception` doesn't catch, so the error stays INTERRUPTED then.
+    error = INTERRUPTED
     try:
         for mode, payload in graph.stream(
             {"question": question, "thread_id": thread_id}, stream_mode=["updates", "messages"]
@@ -274,6 +218,8 @@ def run_turn(
             for node, update in payload.items():
                 if not update:
                     continue
+                state.update(update)
+                saved = saved or node == "save_turn"
                 attempts = update.get("attempts", attempts)
                 new = steps_from_update(
                     node, update, question=question, attempts=attempts, max_retries=max_retries
@@ -287,12 +233,25 @@ def run_turn(
                 steps.extend(new)
     except Exception as e:
         logger.exception("Agent run failed")
+        error = str(e) or type(e).__name__
         if live is not None:
             kept, _ = live.finish([], failed=True)
             steps.extend(kept)
-        error = Step("error", str(e) or type(e).__name__, label="The agent failed")
-        render_step(error)
-        steps.append(error)
+        failed = Step("error", error, label="The agent failed")
+        render_step(failed)
+        steps.append(failed)
+    finally:
+        if not saved:
+            if error == INTERRUPTED:
+                # No Streamlit calls while the run is being stopped: the next run draws these.
+                if live is not None:
+                    steps.extend(live.streamed_steps())
+                steps.append(Step("error", INTERRUPTED, label="Interrupted"))
+            if save_unfinished is not None:
+                try:
+                    save_unfinished(unfinished_turn(state, error, live))
+                except Exception:
+                    logger.exception("Could not save the unfinished turn (thread %s)", thread_id)
 
 
 # --- session and sidebar -------------------------------------------------------------------------
@@ -463,14 +422,16 @@ def main(
         ]
         with st.chat_message("user"):
             st.markdown(escape_md(question))
+        thread_id = st.session_state.thread_id
         with st.chat_message("assistant"):
             render_step(steps[0])
             run_turn(
                 graph_for(model),
                 question,
-                st.session_state.thread_id,
+                thread_id,
                 steps,
                 settings.max_sql_retries,
+                save_unfinished=lambda turn: store.append(thread_id, {**turn, "model": model.name}),
             )
         st.rerun()  # redraw the sidebar, which now lists this conversation first
 

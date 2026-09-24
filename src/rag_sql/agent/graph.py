@@ -35,7 +35,8 @@ def route_after_validate(
 
 
 def route_after_execute(state: AgentState, max_retries: int) -> Literal["answer", "generate_sql"]:
-    if not state.get("error"):
+    if not state.get("error") or state.get("db_unavailable"):
+        # A new query can't fix an unavailable database: report it without more model calls.
         return "answer"
     return "generate_sql" if _should_retry(state, max_retries) else "answer"
 

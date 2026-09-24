@@ -19,8 +19,8 @@ wheels/
 # Jupyter
 .ipynb_checkpoints/
 
-# Test
-demo2.ipynb
+# Scratch notebooks (demo2.ipynb, demo3.ipynb, ...); notebooks/demo.ipynb is the one kept
+notebooks/demo[0-9]*.ipynb
 
 # Large datasets (loaded into Postgres by db/init)
 data/structured/Instacart Market Basket Analysis/

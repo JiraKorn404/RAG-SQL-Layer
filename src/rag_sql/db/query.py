@@ -5,6 +5,7 @@ from typing import Any
 
 import sqlglot
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
@@ -40,7 +41,14 @@ _FORBIDDEN_FUNCTION_PREFIXES = (
     "set_config",
     "lo_",
     "dblink",
+    # Run a query given as a string, which the checks above never see.
+    "query_to_xml",  # also query_to_xmlschema, query_to_xml_and_xmlschema
+    "cursor_to_xml",
 )
+
+# SQLSTATE classes meaning the database can't be used right now, not that the query is wrong:
+# connection exception, invalid authorization, unknown database, too many connections, shutdown.
+_UNAVAILABLE_SQLSTATES = ("08", "28", "3D", "53300", "57P")
 
 
 class SQLValidationError(ValueError):
@@ -62,12 +70,25 @@ def _function_name(node: exp.Func) -> str:
     return (node.name if isinstance(node, exp.Anonymous) else node.sql_name()).lower()
 
 
+def _row_count_limit(tree: exp.Expression) -> int | None:
+    """The outer query's LIMIT / FETCH FIRST as a number; None when absent or not a literal."""
+    limit = tree.args.get("limit")
+    if limit is None:
+        return None
+    count = limit.args.get("count") if isinstance(limit, exp.Fetch) else limit.expression
+    if isinstance(count, exp.Literal) and count.is_int:
+        return int(count.this)
+    return None
+
+
 def validate_sql(sql: str, row_limit: int) -> str:
     """Return a normalized, safe version of `sql`, or raise SQLValidationError.
 
-    Accepts exactly one SELECT / WITH ... SELECT / set operation (UNION, ...). Adds
-    `LIMIT row_limit` when the outer query has none. The returned SQL is regenerated from the
-    parsed tree, so what runs is exactly what was checked.
+    Accepts exactly one SELECT / WITH ... SELECT / set operation (UNION, ...). The outer query
+    gets `LIMIT row_limit + 1` when it has no limit, or one above that (or not a plain number):
+    the extra row lets `run_query` tell that the result was cut at `row_limit`, and nothing
+    larger is ever fetched. The returned SQL is regenerated from the parsed tree, so what runs
+    is exactly what was checked.
     """
     if not sql or not sql.strip():
         raise SQLValidationError("Empty SQL statement.")
@@ -100,15 +121,18 @@ def validate_sql(sql: str, row_limit: int) -> str:
         ):
             raise SQLValidationError(f"Function {_function_name(node)}() is not allowed.")
 
-    if tree.args.get("limit") is None:
-        tree = tree.limit(row_limit)
+    cap = row_limit + 1
+    limit = _row_count_limit(tree)
+    if limit is None or limit > cap:
+        tree = tree.limit(cap)
     return tree.sql(dialect=DIALECT, pretty=True)
 
 
 def run_query(engine: Engine, sql: str, *, row_limit: int, timeout_ms: int) -> QueryResult:
     """Run an already validated query in a read-only transaction with a statement timeout.
 
-    Fetches at most `row_limit` rows; `truncated` is set when more were available.
+    Fetches at most `row_limit` rows; `truncated` is set when more were available. Rows come
+    from a server-side cursor, so a query without a small LIMIT never loads its whole result.
     """
     with engine.connect() as conn:
         conn.exec_driver_sql("SET TRANSACTION READ ONLY")
@@ -119,7 +143,9 @@ def run_query(engine: Engine, sql: str, *, row_limit: int, timeout_ms: int) -> Q
         )
         # no_parameters: the driver gets the statement as-is, so '%' and ':name' in it are never
         # treated as placeholders. Errors still surface as sqlalchemy.exc.DBAPIError.
-        result = conn.execution_options(no_parameters=True).exec_driver_sql(sql)
+        result = conn.execution_options(no_parameters=True, stream_results=True).exec_driver_sql(
+            sql
+        )
         if result.returns_rows:
             columns = list(result.keys())
             rows = [tuple(r) for r in result.fetchmany(row_limit + 1)]
@@ -130,3 +156,17 @@ def run_query(engine: Engine, sql: str, *, row_limit: int, timeout_ms: int) -> Q
 
     truncated = len(rows) > row_limit
     return QueryResult(columns=columns, rows=rows[:row_limit], truncated=truncated)
+
+
+def is_database_unavailable(error: DBAPIError) -> bool:
+    """True when `error` means the database can't be reached or used, so rewriting the SQL won't
+    help: a refused or lost connection, bad credentials, a shutdown. Query errors, including a
+    statement timeout, are False.
+    """
+    if error.connection_invalidated:
+        return True
+    sqlstate = getattr(error.orig, "sqlstate", None)
+    if sqlstate is None:
+        # No answer from the server: the connection failed before or while sending the query.
+        return isinstance(error, (OperationalError, InterfaceError))
+    return sqlstate.startswith(_UNAVAILABLE_SQLSTATES)

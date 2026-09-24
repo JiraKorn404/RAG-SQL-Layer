@@ -1,13 +1,13 @@
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from streamlit.testing.v1 import AppTest
 
 from rag_sql.agent.graph import build_graph
-from rag_sql.db.query import QueryResult
 from rag_sql.llm import ChatModelInfo
-from rag_sql.web import escape_md, model_label, steps_from_turn, steps_from_update
-from tests.conftest import TABLE_DOC, fake_llm, make_turn
+from rag_sql.steps import Step
+from rag_sql.web import INTERRUPTED, model_label, run_turn
+from tests.conftest import fake_llm
 
 SQL_REPLY = AIMessage(
     content="```sql\nSELECT emp_name, salary FROM employees\n```",
@@ -18,101 +18,9 @@ ANSWER_REPLY = AIMessage(
 )
 
 
-def _steps(node: str, update: dict, question: str = "Q?", attempts: int = 1) -> list:
-    return steps_from_update(node, update, question=question, attempts=attempts, max_retries=2)
-
-
-def test_condensed_question_shown_only_when_rewritten() -> None:
-    assert _steps("condense_question", {"standalone_question": "Q?"}) == []
-    [step] = _steps("condense_question", {"standalone_question": "Q about sales?"})
-    assert step.kind == "caption"
-    assert "Q about sales?" in step.text
-
-
-def test_history_caption_only_with_earlier_turns() -> None:
-    assert _steps("load_history", {"history": []}) == []
-    [step] = _steps("load_history", {"history": [make_turn("A?"), make_turn("B?")]})
-    assert step.text.startswith("2 earlier")
-
-
-def test_context_caption_lists_tables() -> None:
-    [step] = _steps("retrieve_context", {"context": [TABLE_DOC]})
-    assert "employees" in step.text
-
-
-def test_generation_without_reasoning_skips_thinking() -> None:
-    steps = _steps("generate_sql", {"sql": "SELECT 1", "reasoning": None, "attempts": 1})
-    assert [s.kind for s in steps] == ["sql"]
-    assert steps[0].label == "SQL"
-
-
-def test_retry_generation_is_labelled_with_attempt() -> None:
-    steps = _steps("generate_sql", {"sql": "SELECT 1", "reasoning": "hmm", "attempts": 2})
-    assert [(s.kind, s.label) for s in steps] == [
-        ("thinking", "Thinking (attempt 2)"),
-        ("sql", "SQL (attempt 2)"),
-    ]
-
-
-@pytest.mark.parametrize(
-    ("node", "attempts", "label"),
-    [
-        ("validate_sql", 1, "Validation error · retry 1 of 2"),
-        ("execute_sql", 3, "Execution error · no retries left"),
-    ],
-)
-def test_error_step(node: str, attempts: int, label: str) -> None:
-    [step] = _steps(node, {"error": "boom"}, attempts=attempts)
-    assert (step.kind, step.label, step.text) == ("error", label, "boom")
-
-
-def test_result_step_has_dataframe_and_truncation_note() -> None:
-    result = QueryResult(columns=["a"], rows=[(1,), (2,)], truncated=True)
-    [step] = _steps("execute_sql", {"result": result, "error": None})
-    assert step.data["a"].tolist() == [1, 2]
-    assert "truncated" in step.text
-
-
-def test_query_example_caption_only_when_saved() -> None:
-    assert _steps("save_query_example", {"example_saved": False}) == []
-    assert len(_steps("save_query_example", {"example_saved": True})) == 1
-
-
-def test_answer_step_includes_its_thinking() -> None:
-    steps = _steps("answer", {"answer": "A.", "answer_reasoning": "One row."})
-    assert [(s.kind, s.label) for s in steps] == [("thinking", "Thinking (answer)"), ("answer", "")]
-    assert [s.kind for s in _steps("answer", {"answer": "A.", "answer_reasoning": None})] == [
-        "answer"
-    ]
-
-
-def test_steps_from_saved_turn() -> None:
-    kinds = [s.kind for s in steps_from_turn(make_turn("Q?"))]
-    assert kinds == ["sql", "caption", "answer"]
-    failed = [s.kind for s in steps_from_turn(make_turn("Q?", sql=None))]
-    assert failed == ["error", "answer"]
-
-
-def test_steps_from_saved_turn_keep_thinking() -> None:
-    turn = make_turn("Q?", sql_reasoning="Plan.", answer_reasoning="Read.")
-    assert [(s.kind, s.label, s.text) for s in steps_from_turn(turn) if s.kind == "thinking"] == [
-        ("thinking", "Thinking", "Plan."),
-        ("thinking", "Thinking (answer)", "Read."),
-    ]
-
-
-def test_saved_turn_shows_its_model_first() -> None:
-    [first, *_] = steps_from_turn(make_turn("Q?", model="qwen3.5:9b"))
-    assert (first.kind, first.text) == ("caption", "Model `qwen3.5:9b`")
-
-
 def test_model_label() -> None:
     assert model_label(ChatModelInfo("qwen3.5:9b", "9.7B", thinking=True)) == "qwen3.5:9b · 9.7B"
     assert model_label(ChatModelInfo("tiny", None, thinking=False)) == "tiny · no thinking"
-
-
-def test_escape_md_keeps_dollars_literal() -> None:
-    assert escape_md("$5 and $6") == r"\$5 and \$6"
 
 
 def _fake_graph(settings, retriever, ok_runner, stores, *replies):
@@ -140,6 +48,86 @@ def test_messages_mode_streams_thinking_per_node(settings, retriever, ok_runner,
                 message.additional_kwargs.get("reasoning_content") or ""
             )
     assert reasoning == {"generate_sql": "Order employees by salary.", "answer": "One row."}
+
+
+class ScriptedGraph:
+    """Stands in for a compiled graph: streams the given items, then raises `error` if set."""
+
+    def __init__(self, items: list, error: BaseException | None = None) -> None:
+        self.items = items
+        self.error = error
+
+    def stream(self, _input: dict, stream_mode: list[str]):
+        yield from self.items
+        if self.error is not None:
+            raise self.error
+
+
+class Stop(BaseException):
+    """Like Streamlit's RerunException for a new question: a BaseException, not an Exception."""
+
+
+def _thinking_token(node: str, text: str) -> tuple:
+    chunk = AIMessageChunk(content="", additional_kwargs={"reasoning_content": text})
+    return ("messages", (chunk, {"langgraph_node": node}))
+
+
+def test_interrupted_run_is_saved_with_what_it_streamed() -> None:
+    items = [
+        ("updates", {"condense_question": {"standalone_question": "Who earns the most money?"}}),
+        _thinking_token("generate_sql", "Sort by salary."),
+    ]
+    saved, steps = [], []
+    with pytest.raises(Stop):
+        run_turn(
+            ScriptedGraph(items, Stop()),
+            "Who earns most?",
+            "t1",
+            steps,
+            2,
+            save_unfinished=saved.append,
+        )
+
+    [turn] = saved
+    assert turn["error"] == INTERRUPTED
+    assert turn["standalone"] == "Who earns the most money?"
+    assert turn["sql_reasoning"] == "Sort by salary."
+    assert (turn["sql"], turn["answer"]) == (None, "")
+    # Kept in the session, so the next run redraws them.
+    assert [s.kind for s in steps] == ["interpreted", "thinking", "error"]
+    assert steps[-1] == Step("error", INTERRUPTED, label="Interrupted")
+
+
+def test_failed_run_is_saved_with_its_error() -> None:
+    items = [("updates", {"generate_sql": {"sql": "SELECT 1", "attempts": 1, "reasoning": None}})]
+    saved, steps = [], []
+    run_turn(
+        ScriptedGraph(items, RuntimeError("Ollama is down")),
+        "Q?",
+        "t1",
+        steps,
+        2,
+        save_unfinished=saved.append,
+    )
+
+    [turn] = saved
+    assert turn["error"] == "Ollama is down"
+    assert steps[-1] == Step("error", "Ollama is down", label="The agent failed")
+
+
+def test_finished_run_is_not_saved_again() -> None:
+    items = [("updates", {"answer": {"answer": "A."}}), ("updates", {"save_turn": {"turn_id": 1}})]
+    saved: list = []
+    run_turn(ScriptedGraph(items), "Q?", "t1", [], 2, save_unfinished=saved.append)
+    assert saved == []
+
+
+def test_failed_save_of_unfinished_run_is_only_logged(caplog) -> None:
+    def broken(_turn) -> None:
+        raise RuntimeError("db down")
+
+    run_turn(ScriptedGraph([], RuntimeError("boom")), "Q?", "t1", [], 2, save_unfinished=broken)
+    assert "Could not save the unfinished turn" in caplog.text
 
 
 APP = """
@@ -213,9 +201,9 @@ def test_app_runs_a_turn_and_lists_the_thread(
     at.sidebar.button[1].click().run()
     assert not at.exception
     assert "Model `gemma4:e4b`" in _captions(at)
-    # The saved SQL is the validated one: formatted, with the LIMIT added.
+    # The saved SQL is the validated one: formatted, with the LIMIT (row_limit + 1) added.
     [code] = at.code
-    assert code.value.endswith("LIMIT 50")
+    assert code.value.endswith("LIMIT 51")
     assert {e.label for e in [*at.expander, *at.status]} >= {"Thinking", "Thinking (answer)"}
 
 

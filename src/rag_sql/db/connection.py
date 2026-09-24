@@ -1,5 +1,6 @@
 """SQLAlchemy engine factory."""
 
+from functools import lru_cache
 from typing import Literal
 
 from sqlalchemy import URL, Engine, create_engine
@@ -7,6 +8,10 @@ from sqlalchemy import URL, Engine, create_engine
 from rag_sql.config import Settings, get_settings
 
 Role = Literal["reader", "admin", "memory"]
+
+# Seconds to wait for each address of the database host. Without it, connecting to a host that
+# is down can hang for minutes before the agent can report that the database is unavailable.
+CONNECT_TIMEOUT_S = 5
 
 
 def get_engine(role: Role = "reader", settings: Settings | None = None) -> Engine:
@@ -17,6 +22,9 @@ def get_engine(role: Role = "reader", settings: Settings | None = None) -> Engin
     - "memory": the chat history role; reads and inserts `chat_memory.chat_turns`, nothing else.
 
     Never run LLM-generated SQL on an engine other than "reader".
+
+    Engines are shared: the same role and connection settings always get the same engine, and so
+    one connection pool (e.g. the chat store and the query history share the "memory" one).
     """
     s = settings or get_settings()
     user, password = {
@@ -33,5 +41,12 @@ def get_engine(role: Role = "reader", settings: Settings | None = None) -> Engin
         port=s.postgres_port,
         database=s.postgres_db,
     )
-    connect_args = {"options": "-c default_transaction_read_only=on"} if role == "reader" else {}
+    return _create_engine(url, read_only=role == "reader")
+
+
+@lru_cache
+def _create_engine(url: URL, *, read_only: bool) -> Engine:
+    connect_args: dict[str, object] = {"connect_timeout": CONNECT_TIMEOUT_S}
+    if read_only:
+        connect_args["options"] = "-c default_transaction_read_only=on"
     return create_engine(url, pool_pre_ping=True, connect_args=connect_args)

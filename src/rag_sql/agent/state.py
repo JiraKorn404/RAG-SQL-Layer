@@ -19,6 +19,7 @@ class AgentState(TypedDict, total=False):
     reasoning: str | None  # model thinking behind the latest SQL, if the model produced any
     sql: str | None  # latest SQL (normalized by validate_sql once it passes)
     error: str | None  # validation or execution error of the latest SQL
+    db_unavailable: bool  # the database couldn't be used (not a SQL problem), so no retry
     attempts: int  # number of SQL generations so far
     result: QueryResult | None
     answer: str

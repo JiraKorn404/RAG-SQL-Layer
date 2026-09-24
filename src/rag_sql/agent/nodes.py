@@ -21,7 +21,7 @@ from rag_sql.agent.prompts import (
     SQL_RETRY_FEEDBACK,
 )
 from rag_sql.agent.state import AgentState
-from rag_sql.db.query import QueryResult, SQLValidationError
+from rag_sql.db.query import QueryResult, SQLValidationError, is_database_unavailable
 from rag_sql.db.query import validate_sql as check_sql
 from rag_sql.memory import ChatStore, Turn
 from rag_sql.query_history import PastQuery, QueryHistory, normalize_question
@@ -223,16 +223,25 @@ def validate_sql(state: AgentState, *, row_limit: int) -> dict:
 
 
 def execute_sql(state: AgentState, *, run_query: Callable[[str], QueryResult]) -> dict:
+    """Run the SQL. An error is kept for a retry, unless the database itself is unavailable."""
     try:
-        return {"result": run_query(state["sql"]), "error": None}
+        return {"result": run_query(state["sql"]), "error": None, "db_unavailable": False}
     except DBAPIError as e:
         # The driver's message (first line) is what the model needs to fix the query.
         message = str(e.orig).strip().splitlines()[0] if e.orig else str(e)
-        return {"result": None, "error": message}
+        return {"result": None, "error": message, "db_unavailable": is_database_unavailable(e)}
 
 
 def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
     result = state.get("result")
+    if result is None and state.get("db_unavailable"):
+        return {
+            "answer": (
+                "I couldn't run the query because the database is unavailable. "
+                f"Error: {state.get('error') or 'unknown'}"
+            ),
+            "answer_reasoning": None,
+        }
     if result is None:
         # Retries exhausted: report the failure without another model call.
         return {
@@ -264,15 +273,13 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
     return {"answer": content, "answer_reasoning": reasoning}
 
 
-def save_turn(state: AgentState, *, store: ChatStore, model: str | None = None) -> dict:
-    """Append this turn to the history, and save it when the run has a thread_id.
+def turn_from_state(state: AgentState, model: str | None = None) -> Turn:
+    """The chat turn for a run's state. The SQL and row count only when the SQL ran.
 
-    `model` is the name of the chat model that answered, recorded with the turn.
-
-    A failed save is logged, not raised: the answer has already been produced.
+    `model` is the name of the chat model that answered. Also used for runs that didn't finish.
     """
     result = state.get("result")
-    turn: Turn = {
+    return {
         "question": state["question"],
         "standalone": current_question(state),
         "sql": state.get("sql") if result is not None else None,
@@ -283,6 +290,16 @@ def save_turn(state: AgentState, *, store: ChatStore, model: str | None = None) 
         "answer_reasoning": state.get("answer_reasoning"),
         "model": model,
     }
+
+
+def save_turn(state: AgentState, *, store: ChatStore, model: str | None = None) -> dict:
+    """Append this turn to the history, and save it when the run has a thread_id.
+
+    `model` is the name of the chat model that answered, recorded with the turn.
+
+    A failed save is logged, not raised: the answer has already been produced.
+    """
+    turn = turn_from_state(state, model)
     turn_id = None
     if thread_id := state.get("thread_id"):
         try:

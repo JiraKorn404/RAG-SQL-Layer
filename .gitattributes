@@ -1,3 +1,6 @@
 # Shell scripts run inside the Linux container; CRLF line endings would break them.
 *.sh text eol=lf
 *.sql text eol=lf
+# Notebooks are committed without outputs; the local copy keeps them.
+# Enable once per clone: uv run nbstripout --install
+*.ipynb filter=nbstripout diff=ipynb

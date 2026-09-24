@@ -1,0 +1,34 @@
+# Lint, format check, unit tests and stripped notebooks, on every push and pull request.
+# Integration tests (Postgres + Ollama) are skipped here, as they are by default locally.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Python version from .python-version; the web extra because tests/test_web.py needs Streamlit.
+      - name: Install
+        run: uv sync --locked --extra web
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Notebooks have no outputs
+        run: uv run nbstripout --verify notebooks/*.ipynb
+
+      - name: Unit tests
+        run: uv run pytest

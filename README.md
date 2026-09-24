@@ -123,7 +123,11 @@ Run `backfill` again after changing `OLLAMA_EMBED_MODEL`.
 ## Development
 
 ```sh
+uv sync --extra web                # the web tests need Streamlit
+uv run nbstripout --install        # once per clone: notebooks are committed without outputs
 uv run pytest                      # unit tests (no network)
 uv run pytest -m integration       # needs Postgres + Ollama
 uv run ruff check . && uv run ruff format .
 ```
+
+CI (`.github/workflows/ci.yml`) runs ruff, checks that committed notebooks have no outputs, and runs the unit tests on every push to `main` and every pull request. With the nbstripout filter installed, your local notebooks keep their outputs; only the committed copy is stripped. Scratch notebooks named `notebooks/demo<N>.ipynb` (e.g. `demo2.ipynb`) are ignored by git.

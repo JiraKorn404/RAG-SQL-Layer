@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.runnables import RunnableLambda
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from rag_sql.agent.graph import build_graph, route_after_execute, route_after_validate
 from rag_sql.db.query import QueryResult
@@ -29,6 +29,7 @@ def test_route_after_validate(state: dict, expected: str) -> None:
         ({"error": None, "attempts": 3}, "answer"),
         ({"error": "db", "attempts": 2}, "generate_sql"),
         ({"error": "db", "attempts": 3}, "answer"),
+        ({"error": "db down", "attempts": 1, "db_unavailable": True}, "answer"),
     ],
 )
 def test_route_after_execute(state: dict, expected: str) -> None:
@@ -84,7 +85,7 @@ def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
         "save_query_example",
     ]
     assert state["standalone_question"] == "Who earns the most?"
-    assert state["sql"].rstrip().endswith("LIMIT 50")
+    assert state["sql"].rstrip().endswith("LIMIT 51")  # row_limit + 1, to detect truncation
     assert state["result"].rows == [("Employee_1", 100.0)]
     assert state["answer"] == "Employee_1."
     assert state["attempts"] == 1
@@ -125,6 +126,24 @@ def test_retries_after_invalid_then_db_error(
     assert state["attempts"] == 3
     assert state["error"] is None
     assert state["answer"] == "Done."
+
+
+def test_unavailable_database_is_not_retried(settings, retriever, chat_store, stores) -> None:
+    def runner(sql: str) -> QueryResult:
+        raise OperationalError(sql, {}, Exception("connection refused"))
+
+    llm = fake_llm("```sql\nSELECT emp_name FROM employees\n```")  # one reply: no retry
+    graph = build_graph(
+        llm=llm, retriever=retriever, query_runner=runner, **stores, settings=settings
+    )
+    order, state = _nodes_run(graph, "q", thread_id="t1")
+
+    assert order.count("generate_sql") == 1
+    assert order[-4:] == ["execute_sql", "answer", "save_turn", "save_query_example"]
+    assert state["db_unavailable"] is True
+    assert state["answer"].startswith("I couldn't run the query because the database")
+    [saved] = chat_store.load("t1")
+    assert saved["error"] == "connection refused"
 
 
 def test_gives_up_after_max_retries(settings, retriever, ok_runner, chat_store, stores) -> None:

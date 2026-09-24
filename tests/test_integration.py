@@ -6,9 +6,10 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from rag_sql.config import get_settings
 from rag_sql.db.connection import get_engine
 from rag_sql.db.introspect import introspect_tables
-from rag_sql.db.query import run_query, validate_sql
+from rag_sql.db.query import is_database_unavailable, run_query, validate_sql
 from rag_sql.memory import get_chat_store, new_thread_id
 from rag_sql.query_history import PostgresQueryHistory, list_examples, set_enabled
 from tests.conftest import KeywordEmbeddings, make_turn
@@ -17,8 +18,33 @@ pytestmark = pytest.mark.integration
 
 
 def test_readonly_role_cannot_write() -> None:
-    with pytest.raises(DBAPIError, match="read-only"):
+    with pytest.raises(DBAPIError, match="read-only"), get_engine().connect() as conn:
+        conn.exec_driver_sql("CREATE TABLE should_fail (a int)")
+
+
+def test_run_query_only_runs_queries() -> None:
+    # Rows come from a server-side cursor (DECLARE ... CURSOR FOR), which only accepts queries.
+    with pytest.raises(DBAPIError, match="syntax error"):
         run_query(get_engine(), "CREATE TABLE should_fail (a int)", row_limit=1, timeout_ms=2000)
+
+
+def test_added_limit_still_reports_truncation() -> None:
+    sql = validate_sql("SELECT emp_name FROM employees", 10)
+    result = run_query(get_engine(), sql, row_limit=10, timeout_ms=5000)
+    assert (result.row_count, result.truncated) == (10, True)
+
+
+def test_unreachable_database_is_unavailable() -> None:
+    engine = get_engine(settings=get_settings().model_copy(update={"postgres_port": 1}))
+    with pytest.raises(DBAPIError) as info:
+        run_query(engine, "SELECT 1", row_limit=1, timeout_ms=2000)
+    assert is_database_unavailable(info.value)
+
+
+def test_query_error_is_not_unavailable() -> None:
+    with pytest.raises(DBAPIError) as info:
+        run_query(get_engine(), "SELECT nope FROM employees", row_limit=1, timeout_ms=2000)
+    assert not is_database_unavailable(info.value)
 
 
 def test_statement_timeout() -> None:

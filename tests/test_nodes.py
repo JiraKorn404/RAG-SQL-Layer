@@ -1,6 +1,6 @@
 import pytest
 from langchain_core.messages import AIMessage
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from rag_sql.agent import nodes
 from rag_sql.db.query import QueryResult
@@ -71,7 +71,7 @@ def test_generate_sql_increments_attempts_and_clears_error() -> None:
 
 def test_validate_sql_node() -> None:
     ok = nodes.validate_sql({"sql": "SELECT 1"}, row_limit=5)
-    assert ok["error"] is None and "LIMIT 5" in ok["sql"]
+    assert ok["error"] is None and "LIMIT 6" in ok["sql"]
     bad = nodes.validate_sql({"sql": "DELETE FROM employees"}, row_limit=5)
     assert "Only SELECT" in bad["error"]
 
@@ -81,12 +81,32 @@ def test_execute_sql_node_reports_db_error() -> None:
         raise ProgrammingError("SELECT nope", {}, Exception('column "nope" does not exist\nLINE 1'))
 
     update = nodes.execute_sql({"sql": "SELECT nope"}, run_query=failing)
-    assert update == {"result": None, "error": 'column "nope" does not exist'}
+    assert update == {
+        "result": None,
+        "error": 'column "nope" does not exist',
+        "db_unavailable": False,
+    }
+
+
+def test_execute_sql_node_flags_unavailable_database() -> None:
+    def failing(_sql: str) -> QueryResult:
+        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+    update = nodes.execute_sql({"sql": "SELECT 1"}, run_query=failing)
+    assert update == {"result": None, "error": "connection refused", "db_unavailable": True}
 
 
 def test_answer_without_result_skips_llm() -> None:
     update = nodes.answer({"question": "q", "attempts": 3, "error": "bad"}, llm=fake_llm())
     assert "3 attempt(s)" in update["answer"] and "bad" in update["answer"]
+
+
+def test_answer_reports_unavailable_database() -> None:
+    state = {"question": "q", "attempts": 1, "error": "refused", "db_unavailable": True}
+    update = nodes.answer(state, llm=fake_llm())
+    assert update["answer"] == (
+        "I couldn't run the query because the database is unavailable. Error: refused"
+    )
 
 
 def test_answer_uses_llm() -> None:

@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Repo root, so `.env` is found whatever the working directory is (the notebook runs in notebooks/).
@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # PostgreSQL
     postgres_host: str = "localhost"
-    postgres_port: int = 5432
+    postgres_port: int = Field(5432, gt=0, le=65535)
     postgres_db: str = "rag"
     postgres_user: str = "postgres"
     postgres_password: SecretStr = SecretStr("")
@@ -40,22 +40,22 @@ class Settings(BaseSettings):
     ollama_reasoning: bool = True
 
     # Agent / SQL execution
-    sql_row_limit: int = 200
-    sql_timeout_ms: int = 15000
-    max_sql_retries: int = 3
+    sql_row_limit: int = Field(200, gt=0)
+    sql_timeout_ms: int = Field(15000, gt=0)  # 0 would mean no timeout in Postgres
+    max_sql_retries: int = Field(3, ge=0)
 
     # Retrieval
     vector_collection: str = "schema_docs"
-    retrieval_k: int = 6
+    retrieval_k: int = Field(6, gt=0)
     # Schemas whose tables are indexed and shown to the model (comma-separated in .env)
     db_schemas: Annotated[tuple[str, ...], NoDecode] = ("public", "imba")
 
     # Chat history: earlier turns shown to the model (0 = none; turns are still saved)
-    chat_history_turns: int = 5
+    chat_history_turns: int = Field(5, ge=0)
 
     # Query history: similar past successful queries given to the model as examples
-    query_history_k: int = 5  # most retrieved (0 = off; queries are still saved)
-    query_history_min_similarity: float = 0.75  # cosine similarity cutoff
+    query_history_k: int = Field(5, ge=0)  # most retrieved (0 = off; queries are still saved)
+    query_history_min_similarity: float = Field(0.75, ge=0, le=1)  # cosine similarity cutoff
 
     @field_validator("db_schemas", mode="before")
     @classmethod
