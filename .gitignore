@@ -18,3 +18,9 @@ wheels/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Test
+demo2.ipynb
+
+# Large datasets (loaded into Postgres by db/init)
+data/structured/Instacart Market Basket Analysis/

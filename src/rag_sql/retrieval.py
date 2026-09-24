@@ -88,7 +88,7 @@ def build_index(
     engine = engine or get_engine("admin", settings=s)
     embeddings = embeddings or get_embeddings(s)
 
-    tables = introspect_tables(engine)
+    tables = introspect_tables(engine, s.db_schemas)
     examples = load_examples(examples_path)
     docs = build_documents(tables, examples)
     logger.info("Indexing %d tables and %d examples", len(tables), len(examples))

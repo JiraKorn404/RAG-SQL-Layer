@@ -41,7 +41,8 @@ RAG-SQL-Layer/
 ├── db/
 │   └── init/                   # SQL run in filename order on first container start:
 │                               #   01-extensions.sql, 02-roles.sh, 03-employees.sql,
-│                               #   04-chat-memory.sh (chat history + query history tables, role)
+│                               #   04-chat-memory.sh (chat history + query history tables, role),
+│                               #   05-imba.sh (Instacart dataset -> schema imba)
 ├── src/rag_sql/
 │   ├── __init__.py
 │   ├── config.py               # Settings (pydantic-settings); the ONLY place env vars are read
@@ -156,6 +157,7 @@ All settings are read in `src/rag_sql/config.py` through a single `Settings` cla
 | `MAX_SQL_RETRIES` | Regenerate attempts on invalid/failed SQL | `3` |
 | `VECTOR_COLLECTION` | pgvector collection name | `schema_docs` |
 | `RETRIEVAL_K` | Docs retrieved per question | `6` |
+| `DB_SCHEMAS` | Schemas indexed and shown to the model (comma-separated; never `chat_memory`) | `public,imba` |
 | `CHAT_HISTORY_TURNS` | Earlier turns shown to the model (0 = none; turns are still saved) | `5` |
 | `QUERY_HISTORY_K` | Most similar past queries given to the model (0 = none; queries are still saved) | `5` |
 | `QUERY_HISTORY_MIN_SIMILARITY` | Cosine similarity cutoff for past queries (tune per embedding model) | `0.75` |

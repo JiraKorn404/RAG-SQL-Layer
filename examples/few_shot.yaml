@@ -77,3 +77,56 @@
     SELECT count(*) FILTER (WHERE salary IS NULL) AS missing_salary,
            count(*) FILTER (WHERE department IS NULL) AS missing_department
     FROM employees;
+
+# --- imba (Instacart orders). imba.order_products has ~34M rows: aggregate it by id first,
+# then join the small lookup tables, so queries finish within SQL_TIMEOUT_MS.
+
+- question: What are the 10 most ordered products?
+  sql: |
+    SELECT p.product_name, t.times_ordered
+    FROM (
+        SELECT product_id, count(*) AS times_ordered
+        FROM imba.order_products
+        GROUP BY product_id
+    ) AS t
+    JOIN imba.products AS p ON p.product_id = t.product_id
+    ORDER BY t.times_ordered DESC
+    LIMIT 10;
+
+- question: What is the reorder rate in each department?
+  sql: |
+    SELECT d.department,
+           round(100.0 * sum(t.reorders) / sum(t.items), 1) AS reorder_rate_pct,
+           sum(t.items) AS items_ordered
+    FROM (
+        SELECT product_id, count(*) AS items, count(*) FILTER (WHERE reordered) AS reorders
+        FROM imba.order_products
+        GROUP BY product_id
+    ) AS t
+    JOIN imba.products AS p ON p.product_id = t.product_id
+    JOIN imba.departments AS d ON d.department_id = p.department_id
+    GROUP BY d.department
+    ORDER BY reorder_rate_pct DESC;
+
+- question: At what hour of the day are most orders placed?
+  sql: |
+    SELECT order_hour_of_day, count(*) AS orders
+    FROM imba.orders
+    GROUP BY order_hour_of_day
+    ORDER BY orders DESC;
+
+- question: How many products does an order contain on average?
+  sql: |
+    SELECT round(avg(n_products), 2) AS avg_products_per_order
+    FROM (
+        SELECT order_id, count(*) AS n_products
+        FROM imba.order_products
+        GROUP BY order_id
+    ) AS per_order;
+
+- question: How many days do customers usually wait between orders?
+  sql: |
+    SELECT round(avg(days_since_prior_order), 1) AS avg_days_between_orders,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY days_since_prior_order) AS median_days
+    FROM imba.orders
+    WHERE days_since_prior_order IS NOT NULL;

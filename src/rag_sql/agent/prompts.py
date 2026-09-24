@@ -33,6 +33,8 @@ SQL_GENERATION_PROMPT = ChatPromptTemplate.from_messages(
             "- Write a single read-only SELECT statement (WITH ... SELECT is fine). Never modify "
             "data or schema.\n"
             "- Use only tables and columns that appear in the schema. Do not invent names.\n"
+            "- Write table names exactly as the schema shows them, including any schema prefix "
+            "(e.g. imba.orders).\n"
             "- Match text values exactly as described in the column comments.\n"
             "- When grouping or ranking by a column that can be NULL, exclude NULL values unless "
             "the question is about missing or unknown data.\n"

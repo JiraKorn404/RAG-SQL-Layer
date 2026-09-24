@@ -2,9 +2,10 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import SecretStr, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Repo root, so `.env` is found whatever the working directory is (the notebook runs in notebooks/).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +47,8 @@ class Settings(BaseSettings):
     # Retrieval
     vector_collection: str = "schema_docs"
     retrieval_k: int = 6
+    # Schemas whose tables are indexed and shown to the model (comma-separated in .env)
+    db_schemas: Annotated[tuple[str, ...], NoDecode] = ("public", "imba")
 
     # Chat history: earlier turns shown to the model (0 = none; turns are still saved)
     chat_history_turns: int = 5
@@ -53,6 +56,17 @@ class Settings(BaseSettings):
     # Query history: similar past successful queries given to the model as examples
     query_history_k: int = 5  # most retrieved (0 = off; queries are still saved)
     query_history_min_similarity: float = 0.75  # cosine similarity cutoff
+
+    @field_validator("db_schemas", mode="before")
+    @classmethod
+    def _split_schemas(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = [s.strip() for s in value.split(",") if s.strip()]
+        if not value:
+            raise ValueError("DB_SCHEMAS needs at least one schema")
+        if "chat_memory" in value:
+            raise ValueError("chat_memory holds chat history and must never be shown to the model")
+        return value
 
 
 @lru_cache
