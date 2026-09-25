@@ -1,0 +1,74 @@
+# Evaluation cases for `uv run rag-sql-eval run`: a question and reference SQL whose result is the
+# right answer. The agent's result is compared with the reference result, not its SQL text.
+#
+# - Keep references to the columns the answer needs: extra columns in the agent's result are
+#   accepted (scored "correct_extra_columns"), missing ones are not.
+# - Order only matters when the reference has an ORDER BY at the top level.
+# - Values are compared as values: numbers allow for rounding, but TRUE and 'Remote' differ. Ask
+#   questions whose answer doesn't depend on how the model labels groups.
+# - References must return fewer than SQL_ROW_LIMIT rows and run within SQL_TIMEOUT_MS.
+# - Questions must not repeat examples/few_shot.yaml (the model would see the answer).
+# - `history` gives earlier turns of a follow-up (question, sql, answer), passed as the graph's
+#   `history` input: no thread is created and nothing is saved.
+# Checked by tests/test_eval_cases.py; the references run in tests/test_integration.py.
+
+- id: emp-remote-salary-gap
+  question: How much higher is the average salary of remote employees than that of on-site employees?
+  sql: |
+    SELECT avg(salary) FILTER (WHERE remote_work) - avg(salary) FILTER (WHERE NOT remote_work)
+      AS salary_gap
+    FROM employees;
+  tags: [employees, aggregate, nulls]
+
+- id: emp-city-most-over-40
+  question: Which city has the most employees older than 40?
+  sql: |
+    SELECT city
+    FROM employees
+    WHERE age > 40
+    GROUP BY city
+    ORDER BY count(*) DESC
+    LIMIT 1;
+  tags: [employees, ranking]
+
+- id: imba-products-per-department
+  question: How many products does each department have?
+  sql: |
+    SELECT d.department, count(*) AS products
+    FROM imba.products AS p
+    JOIN imba.departments AS d USING (department_id)
+    GROUP BY d.department;
+  tags: [imba, join, aggregate]
+
+- id: imba-first-in-cart
+  question: Which product is most often the first one added to the cart?
+  sql: |
+    SELECT p.product_name
+    FROM imba.order_products AS op
+    JOIN imba.products AS p USING (product_id)
+    WHERE op.add_to_cart_order = 1
+    GROUP BY p.product_name
+    ORDER BY count(*) DESC
+    LIMIT 1;
+  tags: [imba, join, heavy]
+
+- id: imba-fewest-products-followup
+  history:
+    - question: Which department has the most products?
+      sql: |
+        SELECT d.department, count(*) AS products
+        FROM imba.products AS p
+        JOIN imba.departments AS d USING (department_id)
+        GROUP BY d.department
+        ORDER BY products DESC
+        LIMIT 1;
+      answer: Personal care has the most products (6,563).
+  question: And which one has the fewest?
+  sql: |
+    SELECT d.department
+    FROM imba.products AS p
+    JOIN imba.departments AS d USING (department_id)
+    GROUP BY d.department
+    ORDER BY count(*) ASC
+    LIMIT 1;
+  tags: [imba, join, followup]

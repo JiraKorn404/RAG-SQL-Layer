@@ -1,11 +1,13 @@
 """Graph state shared by nodes, graph routing and the display layer."""
 
-from typing import TypedDict
+import operator
+from typing import Annotated, TypedDict
 
 from langchain_core.documents import Document
 
 from rag_sql.db.query import QueryResult
 from rag_sql.memory import Turn
+from rag_sql.metrics import NodeMetric, TurnMetrics
 from rag_sql.query_history import PastQuery
 
 
@@ -26,3 +28,7 @@ class AgentState(TypedDict, total=False):
     answer_reasoning: str | None  # model thinking behind the answer, if the model produced any
     turn_id: int | None  # id of the saved chat turn
     example_saved: bool  # whether this turn was added to the query history
+    # One per node run, added by the timing wrapper in graph.py; the reducer appends, so each
+    # SQL attempt keeps its own entries.
+    metrics: Annotated[list[NodeMetric], operator.add]
+    turn_metrics: TurnMetrics | None  # summary of `metrics`, saved with the turn by save_turn

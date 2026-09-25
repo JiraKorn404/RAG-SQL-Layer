@@ -2,6 +2,9 @@ from typing import Any
 
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableLambda
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -93,6 +96,52 @@ def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
     assert [t["answer"] for t in state["history"]] == ["Employee_1."]
     assert chat_store.threads() == []
     assert state["example_saved"] is False
+
+
+def test_every_node_run_is_timed(settings, retriever, chat_store, stores) -> None:
+    usage = {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+    llm = fake_llm(
+        AIMessage(content="DROP TABLE employees", usage_metadata=usage),  # rejected: a retry
+        AIMessage(content="```sql\nSELECT 1\n```", usage_metadata=usage),
+        AIMessage(content="One.", usage_metadata=usage),
+    )
+    graph = build_graph(
+        llm=llm,
+        retriever=retriever,
+        query_runner=lambda _sql: QueryResult(columns=["a"], rows=[(1,)]),
+        **stores,
+        settings=settings,
+    )
+    state = graph.invoke({"question": "q", "thread_id": "t1"})
+
+    # The reducer keeps one metric per node run, so both SQL attempts show.
+    assert [(m["node"], m["attempt"]) for m in state["metrics"]] == [
+        ("load_history", 0),
+        ("condense_question", 0),
+        ("retrieve_context", 0),
+        ("find_similar_queries", 0),
+        ("generate_sql", 1),
+        ("validate_sql", 1),
+        ("generate_sql", 2),
+        ("validate_sql", 2),
+        ("execute_sql", 2),
+        ("answer", 2),
+        ("save_turn", 2),
+        ("save_query_example", 2),
+    ]
+    assert all(m["ms"] >= 0 for m in state["metrics"])
+    assert [m["node"] for m in state["metrics"] if m["input_tokens"]] == [
+        "generate_sql",
+        "generate_sql",
+        "answer",
+    ]
+    assert "llm_usage" not in state  # moved into the metrics, never state
+
+    [saved] = chat_store.load("t1")
+    assert saved["metrics"] == state["turn_metrics"]
+    # The turn's time ends with the answer: saving it is left out.
+    assert saved["metrics"]["nodes"][-1]["node"] == "answer"
+    assert (saved["metrics"]["attempts"], saved["metrics"]["input_tokens"]) == (2, 300)
 
 
 def test_retries_after_invalid_then_db_error(
@@ -272,3 +321,49 @@ def test_empty_result_is_not_saved_as_example(settings, retriever, stores, query
 
     assert state["example_saved"] is False
     assert query_history.search("Average salary of remote employees?", 5, 0.0) == []
+
+
+class OllamaLikeModel(BaseChatModel):
+    """Streams its replies token by token with usage only on the final chunk, like ChatOllama."""
+
+    replies: list[str]
+
+    @property
+    def _llm_type(self) -> str:
+        return "ollama-like"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs: Any) -> ChatResult:
+        raise AssertionError("only called through streaming in this test")
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs: Any):
+        text = self.replies.pop(0)
+        for token in text:
+            chunk = ChatGenerationChunk(message=AIMessageChunk(content=token))
+            if run_manager:
+                run_manager.on_llm_new_token(token, chunk=chunk)
+            yield chunk
+        usage = {"input_tokens": 50, "output_tokens": len(text), "total_tokens": 50 + len(text)}
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                usage_metadata=usage,
+                response_metadata={"total_duration": 2_000_000_000, "load_duration": 1_500_000_000},
+            )
+        )
+
+
+def test_usage_survives_streamed_model_calls(settings, retriever, ok_runner, stores) -> None:
+    # The web UI streams with "messages", which makes llm.invoke() stream: the usage on the
+    # final chunk must still reach the node's metric.
+    llm = OllamaLikeModel(replies=["```sql\nSELECT 1\n```", "One."])
+    graph = build_graph(
+        llm=llm, retriever=retriever, query_runner=ok_runner, **stores, settings=settings
+    )
+    usage = {}
+    for mode, payload in graph.stream({"question": "q"}, stream_mode=["updates", "messages"]):
+        if mode == "updates":
+            for node, update in payload.items():
+                for m in (update or {}).get("metrics", []):
+                    if m["input_tokens"]:
+                        usage[node] = (m["llm_ms"], m["load_ms"], m["input_tokens"])
+    assert usage == {"generate_sql": (2000, 1500, 50), "answer": (2000, 1500, 50)}

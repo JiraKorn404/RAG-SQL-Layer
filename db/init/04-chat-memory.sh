@@ -2,7 +2,8 @@
 # Creates the chat history tables and the role that reads and writes them (CHAT_DB_USER):
 #   chat_turns      every question and answer, per conversation (thread_id)
 #   query_examples  successful question + SQL pairs with embeddings, retrieved as SQL examples
-# - Both live in their own schema, chat_memory. The agent's read-only role gets no access to it,
+#   turn_metrics    time and tokens of each node of a turn
+# - All live in their own schema, chat_memory. The agent's read-only role gets no access to it,
 #   so generated SQL can never read past conversations, and it is not indexed by rag-sql-index.
 # - The chat role can only SELECT and INSERT there: history is append-only and kept forever.
 #   Examples are disabled/enabled by the admin (`rag-sql-history disable|enable`).
@@ -78,8 +79,31 @@ COMMENT ON COLUMN chat_memory.query_examples.question IS 'Standalone question (f
 COMMENT ON COLUMN chat_memory.query_examples.embedding IS 'Embedding of question, made with embed_model.';
 COMMENT ON COLUMN chat_memory.query_examples.enabled IS 'false = excluded from retrieval and never re-added.';
 
+-- Time and tokens of each node of a turn (src/rag_sql/metrics.py), one row per node run in
+-- run order; a turn's totals are sums over its rows. Rows go when their turn is deleted (admin).
+CREATE TABLE IF NOT EXISTS chat_memory.turn_metrics (
+    turn_id       bigint   NOT NULL REFERENCES chat_memory.chat_turns (id) ON DELETE CASCADE,
+    seq           smallint NOT NULL,
+    node          text     NOT NULL,
+    attempt       smallint NOT NULL,
+    ms            integer  NOT NULL,
+    llm_ms        integer,
+    load_ms       integer,
+    input_tokens  integer,
+    output_tokens integer,
+    PRIMARY KEY (turn_id, seq)
+);
+
+COMMENT ON TABLE chat_memory.turn_metrics IS 'Time and tokens of each node run of a chat turn. Append-only.';
+COMMENT ON COLUMN chat_memory.turn_metrics.seq IS 'Position of the node run within the turn, from 0.';
+COMMENT ON COLUMN chat_memory.turn_metrics.attempt IS 'SQL attempt the node ran in; 0 before the first SQL generation.';
+COMMENT ON COLUMN chat_memory.turn_metrics.ms IS 'Wall time of the node, including model and database calls.';
+COMMENT ON COLUMN chat_memory.turn_metrics.llm_ms IS 'Model time reported by Ollama; NULL for nodes without a model call.';
+COMMENT ON COLUMN chat_memory.turn_metrics.load_ms IS 'Part of llm_ms spent loading the model into memory (cold start).';
+
 GRANT CONNECT ON DATABASE :"db_name" TO :"chat_user";
 GRANT USAGE ON SCHEMA chat_memory TO :"chat_user";
 GRANT SELECT, INSERT ON chat_memory.chat_turns TO :"chat_user";
 GRANT SELECT, INSERT ON chat_memory.query_examples TO :"chat_user";
+GRANT SELECT, INSERT ON chat_memory.turn_metrics TO :"chat_user";
 SQL

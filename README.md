@@ -120,6 +120,34 @@ uv run rag-sql-history disable 12 15     # a query ran but was wrong: stop using
 
 Run `backfill` again after changing `OLLAMA_EMBED_MODEL`.
 
+### Metrics
+
+Every answer records how long each step took and, for model calls, the model time, the time spent loading the model into memory (a cold start, e.g. after switching models) and the tokens. The notebook and the web UI show a summary under each answer, such as `12.3 s · 2 attempts · 1.8k tokens · model load 4.1 s`, with a per-step table inside. They're saved with the conversation, one row per step in `chat_memory.turn_metrics`.
+
+```sh
+uv run rag-sql-metrics              # per model, last 30 days: turns, success rate, attempts, p50/p95 latency, tokens, cold loads
+uv run rag-sql-metrics --days 7 --model gemma4:e4b
+```
+
+On a database created before metrics existed, add the table once (safe to re-run):
+
+```sh
+docker compose exec postgres bash /docker-entrypoint-initdb.d/04-chat-memory.sh
+```
+
+### Evaluating models
+
+`examples/eval.yaml` holds test questions with reference SQL. `rag-sql-eval` runs them through the agent and compares the agent's result with the reference result by value: column names, column order and rounding don't matter, and extra columns are allowed. It reports accuracy, retries, latency and tokens per model, and writes one JSON file per model to `eval_results/` (kept locally, not committed). Eval runs save nothing to chat or query history, and don't use past queries unless you pass `--with-history`.
+
+```sh
+uv run rag-sql-eval run                                   # OLLAMA_CHAT_MODEL, all cases
+uv run rag-sql-eval run --models gemma4:e4b,qwen3.5:9b    # compare models
+uv run rag-sql-eval run --tags imba --limit 3             # a quick subset
+uv run rag-sql-eval compare eval_results/A.json eval_results/B.json   # what changed between two runs
+```
+
+Run it before and after changing a prompt, the retrieval or the model, then `compare` the two files. A full run takes about a minute per case with a thinking model, more when the model has to load first.
+
 ## Development
 
 ```sh

@@ -27,6 +27,7 @@ The design priority is **modularity**. Each concern (config, LLM, database, retr
 | DB access | SQLAlchemy 2.x + psycopg 3 |
 | SQL validation | `sqlglot` (parse, and enforce read-only statements) |
 | CI | GitHub Actions (`.github/workflows/ci.yml`): ruff, stripped notebooks, unit tests |
+| Metrics / evaluation | Per-node time and tokens in `chat_memory.turn_metrics` (`metrics.py`); scored test questions (`evaluation/`, `examples/eval.yaml`) |
 | Config | `pydantic-settings`, loaded from `.env` |
 | Output | Jupyter (`notebooks/`), rendered with `IPython.display` + pandas (optional extra `notebook`) |
 | Web UI | **Streamlit** (`web.py`, optional extra `web`), served by the compose service `web` |
@@ -37,7 +38,8 @@ The design priority is **modularity**. Each concern (config, LLM, database, retr
 RAG-SQL-Layer/
 ├── CLAUDE.md
 ├── README.md
-├── pyproject.toml              # deps (+ extras "web", "notebook") + [project.scripts] rag-sql-index, rag-sql-history
+├── pyproject.toml              # deps (+ extras "web", "notebook") + [project.scripts] rag-sql-index,
+│                               #   rag-sql-history, rag-sql-metrics, rag-sql-eval
 ├── .github/workflows/ci.yml    # CI: ruff check + format, nbstripout --verify, pytest
 ├── .gitattributes             # LF for .sh/.sql; nbstripout filter for notebooks
 ├── docker-compose.yml          # Postgres + pgvector, and the Streamlit web UI (service "web")
@@ -48,12 +50,14 @@ RAG-SQL-Layer/
 ├── db/
 │   └── init/                   # SQL run in filename order on first container start:
 │                               #   01-extensions.sql, 02-roles.sh, 03-employees.sql,
-│                               #   04-chat-memory.sh (chat history + query history tables, role),
+│                               #   04-chat-memory.sh (chat history, query history and turn metrics
+│                               #   tables, role),
 │                               #   05-imba.sh (Instacart dataset -> schema imba)
 ├── src/rag_sql/
 │   ├── __init__.py
 │   ├── config.py               # Settings (pydantic-settings); the ONLY place env vars are read
-│   ├── llm.py                  # get_chat_model(), get_embeddings(), list_chat_models() (Ollama)
+│   ├── llm.py                  # get_chat_model(), get_embeddings() (shared, caches query vectors), list_chat_models() (Ollama)
+│   ├── metrics.py              # NodeMetric/TurnMetrics, usage_of(), summarize() (pure), main() CLI rag-sql-metrics
 │   ├── db/
 │   │   ├── __init__.py
 │   │   ├── connection.py       # get_engine("reader"|"admin"|"memory") -> SQLAlchemy engine (one per role)
@@ -61,19 +65,26 @@ RAG-SQL-Layer/
 │   │   └── query.py            # validate_sql() (sqlglot, pure) + run_query() -> QueryResult,
 │   │                           #   is_database_unavailable()
 │   ├── retrieval.py            # build Documents, (re)build pgvector index, get_retriever(), main() CLI
-│   ├── memory.py               # chat history: Turn, ChatStore (in-memory + Postgres), get_chat_store()
+│   ├── memory.py               # chat history: Turn (+ metrics), ChatStore (in-memory + Postgres), get_chat_store(), turn_stats()
 │   ├── query_history.py        # successful past queries (pgvector): QueryHistory, get_query_history(), main() CLI
 │   ├── agent/
 │   │   ├── __init__.py
 │   │   ├── state.py            # AgentState TypedDict (shared by nodes, graph, display)
 │   │   ├── prompts.py          # all prompt templates (no prompts elsewhere)
 │   │   ├── nodes.py            # one function per graph node
-│   │   └── graph.py            # build_graph() -> compiled LangGraph
+│   │   └── graph.py            # build_graph() -> compiled LangGraph; timed() wraps every node
 │   ├── steps.py                # Step + steps_from_update()/steps_from_turn(): what each node shows, no UI code
 │   ├── display.py              # run_and_display(), Chat, show_threads(): draws Steps in Jupyter
-│   └── web.py                  # Streamlit chat app: draws Steps, sidebar history, live thinking
+│   ├── web.py                  # Streamlit chat app: draws Steps, sidebar history, live thinking
+│   └── evaluation/
+│       ├── __init__.py
+│       ├── cases.py            # EvalCase, load_cases() from examples/eval.yaml (checked: ids, no few-shot overlap)
+│       ├── scoring.py          # compare() agent result vs reference result (pure)
+│       └── runner.py           # run cases per model, report, JSON results, compare; main() CLI rag-sql-eval
 ├── examples/
-│   └── few_shot.yaml           # question -> SQL pairs used for retrieval
+│   ├── few_shot.yaml           # question -> SQL pairs used for retrieval
+│   └── eval.yaml               # evaluation cases: question + reference SQL (+ history for follow-ups)
+├── eval_results/               # rag-sql-eval output, one JSON per model and run (local only, ignored)
 ├── notebooks/
 │   └── demo.ipynb              # main entry point (demo2.ipynb, demo3.ipynb, ...: local scratch, ignored)
 └── tests/
@@ -86,7 +97,8 @@ Structure rules:
 - `steps.py` decides what each node update or saved turn shows; `display.py` and `web.py` only draw `Step`s. Keep UI calls out of `steps.py`, and node-specific logic out of the two front ends.
 - Merge files only when they share one concern and change together. Keep `agent/state.py` separate (shared contract, avoids circular imports) and `agent/prompts.py` separate (most-edited file).
 - `db/introspect.py` (admin, used by indexing) and `db/query.py` (read-only, used by the agent) stay apart, so the agent's code path never touches admin credentials.
-- `memory.py` (chat turns) and `query_history.py` (past queries) are the only modules that touch `chat_memory`, and only through the "memory" engine (the admin engine only for `rag-sql-history disable|enable`).
+- `memory.py` (chat turns, their metrics, `turn_stats()`) and `query_history.py` (past queries) are the only modules that touch `chat_memory`, and only through the "memory" engine (the admin engine only for `rag-sql-history disable|enable`).
+- `metrics.py` is pure (types, summaries); storing metrics is `memory.py`'s job. `evaluation/scoring.py` is pure too; everything that runs models or queries is in `evaluation/runner.py`.
 - Split `retrieval.py` back into `retrieval/indexer.py` + `retrieval/retriever.py` if it grows past about 250 lines.
 
 ## Agent graph (LangGraph)
@@ -108,9 +120,11 @@ START
 END
 ```
 
-`AgentState` (in `agent/state.py`) carries: `thread_id`, `history` (earlier `Turn`s), `question`, `standalone_question`, `context` (retrieved docs), `similar_queries` (`PastQuery`s), `reasoning`, `sql`, `error`, `db_unavailable` (the error is a connection/availability problem, so it isn't retried), `attempts`, `result` (columns + rows), `answer`, `answer_reasoning`, `turn_id`, `example_saved`.
+Every node is wrapped by `timed()` in `graph.py`: its update also carries one `NodeMetric` (node, SQL attempt, wall ms, and for model calls Ollama's model ms, load ms and tokens). Nodes that call the model return `llm_usage` (`metrics.usage_of(message)`); the wrapper moves it into the metric, so it never reaches state.
 
-Chat history: every run is one turn. History is loaded and saved only when the input has a `thread_id`; without one, `history` passed in the input is used and the new turn is returned in state, so a stateless caller can carry it. Stored turns hold question, standalone question, SQL, row count, answer, error, the model's thinking (`sql_reasoning` of the last SQL attempt, `answer_reasoning`) and the chat `model` that answered (injected into `save_turn` by `build_graph` from the LLM's name), never result rows. Thinking is never put into prompts.
+`AgentState` (in `agent/state.py`) carries: `thread_id`, `history` (earlier `Turn`s), `question`, `standalone_question`, `context` (retrieved docs), `similar_queries` (`PastQuery`s), `reasoning`, `sql`, `error`, `db_unavailable` (the error is a connection/availability problem, so it isn't retried), `attempts`, `result` (columns + rows), `answer`, `answer_reasoning`, `turn_id`, `example_saved`, `metrics` (`NodeMetric`s; the reducer appends, so every SQL attempt keeps its entries) and `turn_metrics` (their summary, set by `save_turn`).
+
+Chat history: every run is one turn. History is loaded and saved only when the input has a `thread_id`; without one, `history` passed in the input is used and the new turn is returned in state, so a stateless caller can carry it. Stored turns hold question, standalone question, SQL, row count, answer, error, the model's thinking (`sql_reasoning` of the last SQL attempt, `answer_reasoning`) the chat `model` that answered (injected into `save_turn` by `build_graph` from the LLM's name) and the turn's `metrics` (one row per node run in `chat_memory.turn_metrics`, written in the same transaction; `save_turn` and later nodes are left out, so the time ends with the answer), never result rows. Thinking is never put into prompts.
 
 Query history: when a saved turn's SQL runs and returns at least one row, its standalone question is embedded (`OLLAMA_EMBED_MODEL`) and stored with the SQL in `chat_memory.query_examples`. Before generating SQL, the agent searches it by cosine similarity (only rows of the current embedding model, only `enabled` ones), keeps matches at or above `QUERY_HISTORY_MIN_SIMILARITY`, one per question, drops ones that duplicate a curated few-shot example, and gives up to `QUERY_HISTORY_K` to the model as a separate prompt section. Retrieved SQL is only an example: it is never executed directly. Identical (question, SQL) pairs are stored once; disabled pairs are never re-added. A failed search or save never blocks an answer.
 
@@ -134,6 +148,7 @@ Rules:
 | `execute_sql.result` | Header "SQL output" + `pandas.DataFrame` (truncated to display limit) |
 | `answer.answer_reasoning` | Collapsible "Thinking (answer)" block; skipped when none |
 | `answer.answer` | Header "Answer" + Markdown (`$` kept literal, not LaTeX) |
+| `save_turn.turn_metrics` | Collapsible muted summary ("12.3 s · 2 attempts · 1.8k tokens · model load 4.1 s") with a per-node table |
 | `save_query_example.example_saved` | Muted "Saved to query history" line, only when saved |
 
 Thinking comes from Ollama reasoning models via `ChatOllama(reasoning=True)` (read from `message.additional_kwargs["reasoning_content"]`). If the model doesn't produce reasoning, skip the block. Don't fail.
@@ -158,9 +173,9 @@ Keep rendering separate from agent logic. The graph must also be usable without 
 - Node updates become `Step`s through `steps.steps_from_update()`, the same as in the notebook. Steps are kept in `st.session_state`, so reruns redraw the chat without calling the agent.
 - The sidebar lists saved conversations (`ChatStore.threads()`) and has "New chat". Each is one left-aligned line (`wrap=False`, plus a small CSS rule scoped to the `chat-history` container; recheck it after a Streamlit upgrade). Opening one loads its turns (`steps.steps_from_turn()`: with the saved thinking, but no result rows, since they aren't stored). The open thread is in the URL (`?thread=<id>`).
 - The sidebar has a **Model** picker. `llm.list_chat_models()` lists the Ollama models whose capabilities (`/api/show`) include `completion` and not `embedding`, cached 60 s. It defaults to `OLLAMA_CHAT_MODEL`, the choice is kept per browser session, and models without the `thinking` capability get `reasoning=False` (Ollama rejects it for them). If Ollama can't be listed, only the configured model is used, with a warning. The embedding model isn't selectable (changing it needs a re-index).
-- Each reply starts with a "Model `<name>`" caption, live and for saved turns.
+- Each reply starts with a "Model `<name>`" caption, live and for saved turns, and ends with an expander titled with the timing summary (per-node table inside), for saved turns too.
 - One graph per model, built on demand (`st.cache_resource` keyed by model name). The retriever, query runner, chat store and query history are built once and shared by all of them, so a model doesn't open its own DB pools. Everything is shared by all browser sessions.
-- A new question sent while a run is going stops that run. What it had shown so far is kept. A run that doesn't reach `save_turn` (stopped by a new question, or failed with an exception, e.g. Ollama unreachable) is still saved, through `run_turn(save_unfinished=...)`, as a turn whose error says why (`INTERRUPTED` or the exception), with what it produced so far. So a reloaded conversation, and the next follow-up, match what was shown.
+- A new question sent while a run is going stops that run. What it had shown so far is kept. A run that doesn't reach `save_turn` (stopped by a new question, or failed with an exception, e.g. Ollama unreachable) is still saved, through `run_turn(save_unfinished=...)`, as a turn whose error says why (`INTERRUPTED` or the exception), with what it produced so far, metrics included (`run_turn` adds up the per-node `metrics` of the updates, like the graph's reducer). So a reloaded conversation, and the next follow-up, match what was shown.
 
 ## Configuration
 
@@ -171,7 +186,7 @@ All settings are read in `src/rag_sql/config.py` through a single `Settings` cla
 | `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` | DB location | `localhost` / `5432` / `rag` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | Admin user (docker, indexing) | |
 | `APP_DB_USER` / `APP_DB_PASSWORD` | **Read-only** role the agent queries with | `rag_reader` |
-| `CHAT_DB_USER` / `CHAT_DB_PASSWORD` | Chat + query history role (`SELECT`, `INSERT` on `chat_memory` tables only) | `rag_memory` |
+| `CHAT_DB_USER` / `CHAT_DB_PASSWORD` | Chat history, query history and metrics role (`SELECT`, `INSERT` on `chat_memory` tables only) | `rag_memory` |
 | `OLLAMA_BASE_URL` | Ollama over Tailscale | `http://<tailscale-host>:11434` |
 | `OLLAMA_CHAT_MODEL` | Chat / SQL model (the web UI's default choice) | e.g. `qwen3:14b` |
 | `OLLAMA_EMBED_MODEL` | Embedding model | e.g. `nomic-embed-text` |
@@ -194,7 +209,8 @@ All settings are read in `src/rag_sql/config.py` through a single `Settings` cla
 - Every query runs inside a read-only transaction with `SET LOCAL statement_timeout`, through a server-side cursor (`stream_results`): at most `SQL_ROW_LIMIT + 1` rows are ever fetched, and only queries can run (`DECLARE ... CURSOR FOR` rejects anything else).
 - Every engine has a `connect_timeout` (`db/connection.py`), so an unreachable database fails in seconds. `execute_sql` sets `db_unavailable` for connection/availability errors (`is_database_unavailable()`), and the graph answers right away instead of asking the model for new SQL.
 - Never interpolate user text into SQL outside the LLM-generated statement. Never run LLM output as the admin user.
-- Chat history lives in its own schema, `chat_memory`, written only by the chat role (`CHAT_DB_USER`) through fixed, parameterized statements in `memory.py`. That role has `SELECT` + `INSERT` on `chat_memory.chat_turns` and `chat_memory.query_examples` and nothing else (history is append-only and kept forever; only the admin can disable or enable examples). `APP_DB_USER` has no access to `chat_memory`, so generated SQL can't read past conversations. Never run LLM output as the chat role. Created by `db/init/04-chat-memory.sh`, which is safe to re-run; on an existing volume run it like `02-roles.sh` above.
+- `rag-sql-eval` runs the reference SQL of `examples/eval.yaml` through `validate_sql()` and `run_query()` as the read-only role, like the agent's SQL. Eval runs have no `thread_id`, so they save nothing to chat or query history.
+- Chat history lives in its own schema, `chat_memory`, written only by the chat role (`CHAT_DB_USER`) through fixed, parameterized statements in `memory.py`. That role has `SELECT` + `INSERT` on `chat_memory.chat_turns`, `chat_memory.query_examples` and `chat_memory.turn_metrics` and nothing else (history is append-only and kept forever; only the admin can disable or enable examples). `APP_DB_USER` has no access to `chat_memory`, so generated SQL can't read past conversations. Never run LLM output as the chat role. Created by `db/init/04-chat-memory.sh`, which is safe to re-run; on an existing volume run it like `02-roles.sh` above.
 - The web container gets `.env` through compose with `POSTGRES_USER` / `POSTGRES_PASSWORD` blanked, so it never holds admin credentials; `.dockerignore` keeps `.env` out of the image. Its port is published on `127.0.0.1` only (Streamlit has no login, and the sidebar shows every saved conversation).
 
 ## Ollama over Tailscale
@@ -225,6 +241,13 @@ uv run rag-sql-history backfill          # embed successful chat turns not store
 uv run rag-sql-history list [--all] [--sql]
 uv run rag-sql-history disable <id>...   # exclude bad examples (admin); `enable` to undo
 
+# Metrics of saved turns: latency, tokens, success, cold model loads per model
+uv run rag-sql-metrics [--days 30] [--model M]
+
+# Evaluation (needs Postgres + Ollama; results in eval_results/, local only)
+uv run rag-sql-eval run [--models A,B] [--tags T] [--limit N] [--repeat K] [--with-history]
+uv run rag-sql-eval compare eval_results/OLD.json eval_results/NEW.json
+
 # Notebook
 uv run jupyter lab notebooks/demo.ipynb
 
@@ -243,20 +266,24 @@ uv run ruff check . && uv run ruff format .
 - Factories (`get_chat_model`, `get_engine`, `get_retriever`, `get_chat_store`, `get_query_history`, `build_graph`) are the seams for swapping implementations. Accept overrides as arguments so tests can inject fakes.
 - All prompts live in `agent/prompts.py` as `ChatPromptTemplate`s. Don't put inline prompt strings in nodes.
 - No side effects at import time: no network or DB connections when a module loads.
-- Use `logging`, not `print`, in library code. Only `display.py` (notebook) and `web.py` (Streamlit) produce UI output.
+- Use `logging`, not `print`, in library code. Only `display.py` (notebook) and `web.py` (Streamlit) produce UI output; CLI `main()`s print their results. CLI output is ASCII only (the Windows console may use a code page such as cp874).
 - Keep the notebook thin: imports plus `run_and_display(...)` / `Chat` calls.
 
 ## Testing
 
 - Unit-test `validate_sql()`, routing functions, and nodes with a fake LLM (`langchain_core.language_models.fake_chat_models.FakeListChatModel`) and no network. Use `InMemoryChatStore` for chat history and `InMemoryQueryHistory` with `tests.conftest.KeywordEmbeddings` for query history.
 - Integration tests that need Postgres or Ollama are marked `@pytest.mark.integration` and skipped by default (and in CI).
+- Give fakes usage with `AIMessage(usage_metadata=..., response_metadata={"total_duration": ...})` to test metrics; `tests/test_graph.py::OllamaLikeModel` streams like ChatOllama (usage on the last chunk).
+- `tests/test_eval_*.py` cover cases, scoring and the runner without network; the references run in `tests/test_integration.py`.
 - Test what a node shows in `tests/test_steps.py` (pure); `tests/test_display.py` and `tests/test_web.py` only check the drawing.
 
 ## When changing things
 
-- **New model**: pull it on the Ollama machine; the web UI lists it within a minute. To make it the default (and the notebook's model), change `OLLAMA_CHAT_MODEL` in `.env`. No code change.
+- **New model**: pull it on the Ollama machine; the web UI lists it within a minute. To make it the default (and the notebook's model), change `OLLAMA_CHAT_MODEL` in `.env`. No code change. Compare it first: `uv run rag-sql-eval run --models old,new`.
+- **Prompt, retrieval or agent change**: run `uv run rag-sql-eval run` before and after, then `rag-sql-eval compare` the two result files.
+- **New eval case**: add it to `examples/eval.yaml` (answer independent of label spelling, reference columns only what the answer needs, fewer rows than `SQL_ROW_LIMIT`); `uv run pytest -m integration -k eval_references` checks the references.
 - **New node / step**: add the function in `nodes.py`, the state fields in `state.py`, wire it in `graph.py`, and map its update to `Step`s in `steps.steps_from_update()`. Touch `render_step()` in `display.py` and `web.py` only for a new `StepKind`.
 - **Schema changed or new few-shot examples**: re-run `uv run rag-sql-index`. Past queries that no longer fit the schema can be excluded with `uv run rag-sql-history disable <id>`.
 - **New embedding model** (`OLLAMA_EMBED_MODEL`): re-run `uv run rag-sql-index` and `uv run rag-sql-history backfill`, then re-tune `QUERY_HISTORY_MIN_SIMILARITY`.
 - **New config key**: add it to `Settings` and `.env.example` together.
-- **Chat or query history table changed**: edit `db/init/04-chat-memory.sh` (keep it idempotent) and the statements in `memory.py` / `query_history.py`, then re-run the script.
+- **Chat history, query history or metrics table changed**: edit `db/init/04-chat-memory.sh` (keep it idempotent) and the statements in `memory.py` / `query_history.py`, then re-run the script.

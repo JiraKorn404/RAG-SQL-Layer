@@ -81,6 +81,14 @@ def render_step(step: Step) -> None:
                 display(step.data)
         case "answer":
             display(Markdown(f"### Answer\n{escape_md(step.text)}"))
+        case "metrics":
+            table = step.data.to_html(index=False, na_rep="", border=0)
+            display(
+                HTML(
+                    f'<details style="{_MUTED}font-size:0.9em"><summary>'
+                    f"{html.escape(step.text)}</summary>{table}</details>"
+                )
+            )
 
 
 def run_and_display(
@@ -147,8 +155,8 @@ class Chat:
         if not turns:
             _muted("No questions in this conversation yet.")
             return
-        # The thinking columns are long; the web UI shows them.
-        display(pd.DataFrame(turns).drop(columns=["sql_reasoning", "answer_reasoning"]))
+        # The thinking columns are long, and the metrics nested; the web UI shows them.
+        display(pd.DataFrame(turns).drop(columns=["sql_reasoning", "answer_reasoning", "metrics"]))
 
 
 def show_threads(limit: int = 20, store: ChatStore | None = None) -> None:

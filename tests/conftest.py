@@ -10,6 +10,7 @@ from langchain_core.runnables import RunnableLambda
 from rag_sql.config import Settings
 from rag_sql.db.query import QueryResult
 from rag_sql.memory import InMemoryChatStore, Turn
+from rag_sql.metrics import TurnMetrics
 from rag_sql.query_history import InMemoryQueryHistory
 
 TABLE_DOC = Document(
@@ -79,6 +80,7 @@ def make_turn(
     sql_reasoning: str | None = None,
     answer_reasoning: str | None = None,
     model: str | None = None,
+    metrics: TurnMetrics | None = None,
 ) -> Turn:
     return {
         "question": question,
@@ -90,6 +92,7 @@ def make_turn(
         "sql_reasoning": sql_reasoning,
         "answer_reasoning": answer_reasoning,
         "model": model,
+        "metrics": metrics,
     }
 
 

@@ -10,6 +10,7 @@ from typing import Any, Literal
 import pandas as pd
 
 from rag_sql.memory import Turn
+from rag_sql.metrics import NodeMetric, TurnMetrics, format_summary
 from rag_sql.query_history import PastQuery
 
 StepKind = Literal[
@@ -22,6 +23,7 @@ StepKind = Literal[
     "error",  # label; text: the error message
     "result",  # text: row count note; data: pandas.DataFrame
     "answer",  # text: the answer (Markdown)
+    "metrics",  # text: one-line summary (time, attempts, tokens); data: pandas.DataFrame per node
 ]
 
 
@@ -48,6 +50,31 @@ def thinking_label(node: str, attempt: int) -> str:
 
 def model_step(model: str) -> Step:
     return Step("model", model)
+
+
+def node_table(nodes: list[NodeMetric]) -> pd.DataFrame:
+    """One row per node run: its time and model usage."""
+    frame = pd.DataFrame.from_records(
+        [
+            {
+                "node": n["node"],
+                "attempt": n["attempt"],
+                "ms": n["ms"],
+                "model ms": n["llm_ms"],
+                "load ms": n["load_ms"],
+                "tokens in": n["input_tokens"],
+                "tokens out": n["output_tokens"],
+            }
+            for n in nodes
+        ],
+        columns=["node", "attempt", "ms", "model ms", "load ms", "tokens in", "tokens out"],
+    )
+    # Nullable integers: empty cells instead of NaN floats for nodes without a model call.
+    return frame.astype({c: "Int64" for c in frame.columns if c != "node"})
+
+
+def metrics_step(metrics: TurnMetrics) -> Step:
+    return Step("metrics", format_summary(metrics), data=node_table(metrics["nodes"]))
 
 
 def steps_from_update(
@@ -103,6 +130,8 @@ def steps_from_update(
         if reasoning := update.get("answer_reasoning"):
             steps.append(Step("thinking", reasoning, label=thinking_label(node, attempts)))
         return [*steps, Step("answer", update.get("answer", ""))]
+    if node == "save_turn" and (metrics := update.get("turn_metrics")):
+        return [metrics_step(metrics)]
     if node == "save_query_example" and update.get("example_saved"):
         return [Step("caption", "Saved to query history as an example for similar questions.")]
     return []
@@ -125,4 +154,6 @@ def steps_from_turn(turn: Turn) -> list[Step]:
         steps.append(Step("thinking", turn["answer_reasoning"], label="Thinking (answer)"))
     if turn["answer"]:
         steps.append(Step("answer", turn["answer"]))
+    if metrics := turn.get("metrics"):
+        steps.append(metrics_step(metrics))
     return steps

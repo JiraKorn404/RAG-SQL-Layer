@@ -188,6 +188,7 @@ def test_app_runs_a_turn_and_lists_the_thread(
     # AppTest lists an expander that has an icon under `status`.
     assert {e.label for e in [*at.expander, *at.status]} >= {"Thinking", "Thinking (answer)"}
     assert any(m.value == r"Employee_1 earns \$100." for m in at.markdown)
+    assert any(e.label.endswith(" s · 1 attempt") for e in at.status)  # timing, live
 
     [thread] = chat_store.threads()
     assert at.session_state["thread_id"] == thread.thread_id
@@ -205,6 +206,7 @@ def test_app_runs_a_turn_and_lists_the_thread(
     [code] = at.code
     assert code.value.endswith("LIMIT 51")
     assert {e.label for e in [*at.expander, *at.status]} >= {"Thinking", "Thinking (answer)"}
+    assert any(e.label.endswith(" s · 1 attempt") for e in at.status)  # saved timing
 
 
 def test_app_uses_the_chosen_model(settings, retriever, ok_runner, stores, chat_store) -> None:

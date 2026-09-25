@@ -1,5 +1,6 @@
 """Graph wiring and routing."""
 
+import time
 from collections.abc import Callable
 from functools import partial
 from typing import Literal
@@ -17,6 +18,7 @@ from rag_sql.db.connection import get_engine
 from rag_sql.db.query import QueryResult, run_query
 from rag_sql.llm import chat_model_name, get_chat_model
 from rag_sql.memory import ChatStore, get_chat_store
+from rag_sql.metrics import node_metric
 from rag_sql.query_history import QueryHistory, get_query_history
 from rag_sql.retrieval import get_retriever
 
@@ -39,6 +41,23 @@ def route_after_execute(state: AgentState, max_retries: int) -> Literal["answer"
         # A new query can't fix an unavailable database: report it without more model calls.
         return "answer"
     return "generate_sql" if _should_retry(state, max_retries) else "answer"
+
+
+def timed(name: str, node: Callable[[AgentState], dict]) -> Callable[[AgentState], dict]:
+    """Wrap a node so its update also carries a NodeMetric: wall time, SQL attempt, and the model
+    usage the node reported as `llm_usage` (removed from the update, it isn't state).
+    """
+
+    def run(state: AgentState) -> dict:
+        start = time.perf_counter()
+        update = dict(node(state))
+        ms = round((time.perf_counter() - start) * 1000)
+        usage = update.pop("llm_usage", None)
+        attempt = update.get("attempts", state.get("attempts", 0))
+        update["metrics"] = [node_metric(name, attempt=attempt, ms=ms, usage=usage)]
+        return update
+
+    return run
 
 
 def default_query_runner(settings: Settings | None = None) -> Callable[[str], QueryResult]:
@@ -76,32 +95,28 @@ def build_graph(
     if query_runner is None:
         query_runner = default_query_runner(s)
 
-    graph = StateGraph(AgentState)
-    graph.add_node(
-        "load_history",
-        partial(nodes.load_history, store=chat_store, max_turns=s.chat_history_turns),
-    )
-    graph.add_node("condense_question", partial(nodes.condense_question, llm=llm))
-    graph.add_node("retrieve_context", partial(nodes.retrieve_context, retriever=retriever))
-    graph.add_node(
-        "find_similar_queries",
-        partial(
+    steps: dict[str, Callable[[AgentState], dict]] = {
+        "load_history": partial(
+            nodes.load_history, store=chat_store, max_turns=s.chat_history_turns
+        ),
+        "condense_question": partial(nodes.condense_question, llm=llm),
+        "retrieve_context": partial(nodes.retrieve_context, retriever=retriever),
+        "find_similar_queries": partial(
             nodes.find_similar_queries,
             query_history=query_history,
             k=s.query_history_k,
             min_similarity=s.query_history_min_similarity,
         ),
-    )
-    graph.add_node("generate_sql", partial(nodes.generate_sql, llm=llm, row_limit=s.sql_row_limit))
-    graph.add_node("validate_sql", partial(nodes.validate_sql, row_limit=s.sql_row_limit))
-    graph.add_node("execute_sql", partial(nodes.execute_sql, run_query=query_runner))
-    graph.add_node("answer", partial(nodes.answer, llm=llm))
-    graph.add_node(
-        "save_turn", partial(nodes.save_turn, store=chat_store, model=chat_model_name(llm))
-    )
-    graph.add_node(
-        "save_query_example", partial(nodes.save_query_example, query_history=query_history)
-    )
+        "generate_sql": partial(nodes.generate_sql, llm=llm, row_limit=s.sql_row_limit),
+        "validate_sql": partial(nodes.validate_sql, row_limit=s.sql_row_limit),
+        "execute_sql": partial(nodes.execute_sql, run_query=query_runner),
+        "answer": partial(nodes.answer, llm=llm),
+        "save_turn": partial(nodes.save_turn, store=chat_store, model=chat_model_name(llm)),
+        "save_query_example": partial(nodes.save_query_example, query_history=query_history),
+    }
+    graph = StateGraph(AgentState)
+    for name, step in steps.items():
+        graph.add_node(name, timed(name, step))
 
     graph.add_edge(START, "load_history")
     graph.add_edge("load_history", "condense_question")

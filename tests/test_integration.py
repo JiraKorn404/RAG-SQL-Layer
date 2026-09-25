@@ -6,11 +6,15 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from rag_sql.agent.graph import default_query_runner
 from rag_sql.config import get_settings
 from rag_sql.db.connection import get_engine
 from rag_sql.db.introspect import introspect_tables
 from rag_sql.db.query import is_database_unavailable, run_query, validate_sql
-from rag_sql.memory import get_chat_store, new_thread_id
+from rag_sql.evaluation.cases import load_cases
+from rag_sql.evaluation.runner import reference_results
+from rag_sql.memory import get_chat_store, new_thread_id, turn_stats
+from rag_sql.metrics import TurnMetrics, node_metric, summarize
 from rag_sql.query_history import PostgresQueryHistory, list_examples, set_enabled
 from tests.conftest import KeywordEmbeddings, make_turn
 
@@ -116,6 +120,56 @@ def test_chat_store_round_trip(test_thread: str) -> None:
     assert (summary.turns, summary.first_question) == (2, "first")
 
 
+def _turn_metrics(load_ms: int = 0) -> TurnMetrics:
+    return summarize(
+        [
+            node_metric("retrieve_context", attempt=0, ms=40, usage=None),
+            node_metric(
+                "generate_sql",
+                attempt=1,
+                ms=3000,
+                usage={
+                    "llm_ms": 2900,
+                    "load_ms": load_ms,
+                    "input_tokens": 800,
+                    "output_tokens": 60,
+                },
+            ),
+            node_metric("execute_sql", attempt=1, ms=15, usage=None),
+        ]
+    )
+
+
+def test_turn_metrics_round_trip(test_thread: str) -> None:
+    store = get_chat_store()
+    with_metrics = make_turn("timed", metrics=_turn_metrics())
+    store.append(test_thread, with_metrics)
+    store.append(test_thread, make_turn("untimed"))  # e.g. saved before metrics existed
+
+    assert store.load(test_thread) == [with_metrics, make_turn("untimed")]
+
+
+def test_turn_stats_per_model(test_thread: str) -> None:
+    model = f"pytest-{new_thread_id()}"
+    store = get_chat_store()
+    store.append(test_thread, make_turn("a", model=model, metrics=_turn_metrics()))
+    store.append(test_thread, make_turn("b", model=model, metrics=_turn_metrics(load_ms=4000)))
+    store.append(test_thread, make_turn("c", sql=None, model=model, metrics=_turn_metrics()))
+
+    [stats] = turn_stats(get_engine("memory"), days=1, model=model)
+    assert (stats.model, stats.turns, stats.avg_attempts) == (model, 3, 1.0)
+    assert stats.success_rate == pytest.approx(2 / 3)
+    assert stats.p50_ms == stats.p95_ms == 3055
+    assert stats.avg_tokens == 860
+    assert stats.cold_load_rate == pytest.approx(1 / 3)
+
+
+def test_chat_role_cannot_change_metrics(test_thread: str) -> None:
+    get_chat_store().append(test_thread, make_turn("timed", metrics=_turn_metrics()))
+    with pytest.raises(DBAPIError, match="permission denied"), get_engine("memory").begin() as conn:
+        conn.execute(text("UPDATE chat_memory.turn_metrics SET ms = 0"))
+
+
 def test_reader_role_cannot_read_chat_history() -> None:
     with pytest.raises(DBAPIError, match="permission denied"):
         run_query(
@@ -217,3 +271,15 @@ def test_reader_role_cannot_read_query_history() -> None:
 def test_chat_role_cannot_enable_or_disable_examples() -> None:
     with pytest.raises(DBAPIError, match="permission denied"):
         set_enabled(get_engine("memory"), [1], enabled=False)
+
+
+# --- evaluation ------------------------------------------------------------------------------
+
+
+def test_eval_references_run_within_limits() -> None:
+    # Each reference must run as the reader role within the timeout, return rows, and fit the
+    # row limit; reference_results raises otherwise.
+    s = get_settings()
+    results = reference_results(load_cases(), default_query_runner(s), s.sql_row_limit)
+    assert results
+    assert all(r.row_count > 0 for r in results.values())

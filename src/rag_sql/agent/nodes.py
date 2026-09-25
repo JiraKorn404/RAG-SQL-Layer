@@ -1,4 +1,8 @@
-"""Graph nodes. Each takes the state (plus injected dependencies) and returns a partial update."""
+"""Graph nodes. Each takes the state (plus injected dependencies) and returns a partial update.
+
+Nodes that call the model also return `llm_usage` (metrics.usage_of). It never reaches the state:
+the timing wrapper in graph.py moves it into the node's metric.
+"""
 
 import logging
 import re
@@ -24,6 +28,7 @@ from rag_sql.agent.state import AgentState
 from rag_sql.db.query import QueryResult, SQLValidationError, is_database_unavailable
 from rag_sql.db.query import validate_sql as check_sql
 from rag_sql.memory import ChatStore, Turn
+from rag_sql.metrics import summarize, usage_of
 from rag_sql.query_history import PastQuery, QueryHistory, normalize_question
 
 logger = logging.getLogger(__name__)
@@ -150,7 +155,7 @@ def condense_question(state: AgentState, *, llm: BaseChatModel) -> dict:
         {"history": format_history(history), "question": question}
     )
     _, content = split_reasoning(message)
-    return {"standalone_question": content or question}
+    return {"standalone_question": content or question, "llm_usage": usage_of(message)}
 
 
 def retrieve_context(state: AgentState, *, retriever: Runnable[str, list[Document]]) -> dict:
@@ -212,6 +217,7 @@ def generate_sql(state: AgentState, *, llm: BaseChatModel, row_limit: int) -> di
         "error": None,
         "result": None,
         "attempts": state.get("attempts", 0) + 1,
+        "llm_usage": usage_of(message),
     }
 
 
@@ -270,13 +276,14 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
         }
     )
     reasoning, content = split_reasoning(message)
-    return {"answer": content, "answer_reasoning": reasoning}
+    return {"answer": content, "answer_reasoning": reasoning, "llm_usage": usage_of(message)}
 
 
 def turn_from_state(state: AgentState, model: str | None = None) -> Turn:
     """The chat turn for a run's state. The SQL and row count only when the SQL ran.
 
     `model` is the name of the chat model that answered. Also used for runs that didn't finish.
+    The metrics cover the nodes that ran so far (save_turn itself and later nodes are left out).
     """
     result = state.get("result")
     return {
@@ -289,6 +296,7 @@ def turn_from_state(state: AgentState, model: str | None = None) -> Turn:
         "sql_reasoning": state.get("reasoning"),
         "answer_reasoning": state.get("answer_reasoning"),
         "model": model,
+        "metrics": summarize(state.get("metrics") or []),
     }
 
 
@@ -306,7 +314,11 @@ def save_turn(state: AgentState, *, store: ChatStore, model: str | None = None) 
             turn_id = store.append(thread_id, turn)
         except Exception:
             logger.exception("Could not save the turn to chat history (thread %s)", thread_id)
-    return {"history": [*state.get("history", []), turn], "turn_id": turn_id}
+    return {
+        "history": [*state.get("history", []), turn],
+        "turn_id": turn_id,
+        "turn_metrics": turn["metrics"],
+    }
 
 
 def save_query_example(state: AgentState, *, query_history: QueryHistory) -> dict:

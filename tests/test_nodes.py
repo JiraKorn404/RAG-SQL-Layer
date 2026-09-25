@@ -5,6 +5,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from rag_sql.agent import nodes
 from rag_sql.db.query import QueryResult
 from rag_sql.memory import InMemoryChatStore
+from rag_sql.metrics import node_metric
 from rag_sql.query_history import InMemoryQueryHistory, PastQuery
 from tests.conftest import EXAMPLE_DOC, TABLE_DOC, KeywordEmbeddings, fake_llm, make_turn
 
@@ -66,6 +67,7 @@ def test_generate_sql_increments_attempts_and_clears_error() -> None:
         "error": None,
         "result": None,
         "attempts": 2,
+        "llm_usage": None,  # the fake model reports no usage
     }
 
 
@@ -118,6 +120,7 @@ def test_answer_uses_llm() -> None:
     assert nodes.answer(state, llm=fake_llm("Employee_1 earns the most.")) == {
         "answer": "Employee_1 earns the most.",
         "answer_reasoning": None,
+        "llm_usage": None,
     }
 
 
@@ -131,6 +134,26 @@ def test_answer_keeps_reasoning() -> None:
     assert nodes.answer(state, llm=fake_llm(reply)) == {
         "answer": "Employee_1.",
         "answer_reasoning": "One row.",
+        "llm_usage": None,
+    }
+
+
+def test_answer_reports_model_usage() -> None:
+    state = {
+        "question": "Top earner?",
+        "sql": "SELECT 1",
+        "result": QueryResult(columns=["emp_name"], rows=[("Employee_1",)]),
+    }
+    reply = AIMessage(
+        content="Employee_1.",
+        usage_metadata={"input_tokens": 120, "output_tokens": 8, "total_tokens": 128},
+        response_metadata={"total_duration": 2_500_000_000, "load_duration": 1_200_000_000},
+    )
+    assert nodes.answer(state, llm=fake_llm(reply))["llm_usage"] == {
+        "llm_ms": 2500,
+        "load_ms": 1200,
+        "input_tokens": 120,
+        "output_tokens": 8,
     }
 
 
@@ -179,7 +202,8 @@ def test_condense_question_rewrites_follow_up() -> None:
     llm = fake_llm(AIMessage(content="<think>resolve it</think>\nLowest paid in Sales?"))
     state = {"question": "And the lowest?", "history": [make_turn("Highest paid in Sales?")]}
     assert nodes.condense_question(state, llm=llm) == {
-        "standalone_question": "Lowest paid in Sales?"
+        "standalone_question": "Lowest paid in Sales?",
+        "llm_usage": None,
     }
 
 
@@ -206,9 +230,35 @@ def test_save_turn_appends_and_saves(chat_store) -> None:
         "sql_reasoning": "Count them.",
         "answer_reasoning": "Two.",
         "model": "qwen3.5:9b",
+        "metrics": None,  # no node metrics in the state
     }
     assert update["history"] == [make_turn("q0"), turn]
     assert chat_store.load("t1") == [turn]
+    assert update["turn_metrics"] is None
+
+
+def test_save_turn_summarizes_node_metrics(chat_store) -> None:
+    generate = node_metric(
+        "generate_sql",
+        attempt=1,
+        ms=900,
+        usage={"llm_ms": 800, "load_ms": 0, "input_tokens": 300, "output_tokens": 40},
+    )
+    execute = node_metric("execute_sql", attempt=1, ms=100, usage=None)
+    state = {"thread_id": "t1", "question": "q", "answer": "A.", "metrics": [generate, execute]}
+
+    update = nodes.save_turn(state, store=chat_store)
+    expected = {
+        "total_ms": 1000,
+        "attempts": 1,
+        "llm_ms": 800,
+        "load_ms": 0,
+        "input_tokens": 300,
+        "output_tokens": 40,
+        "nodes": [generate, execute],
+    }
+    assert update["turn_metrics"] == expected
+    assert chat_store.load("t1")[0]["metrics"] == expected
 
 
 def test_save_turn_failure_is_logged_not_raised(caplog) -> None:

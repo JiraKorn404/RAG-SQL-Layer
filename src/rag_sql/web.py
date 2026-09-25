@@ -101,6 +101,9 @@ def render_step(step: Step) -> None:
         case "answer":
             st.markdown("**Answer**")
             st.markdown(escape_md(step.text))
+        case "metrics":
+            with st.expander(step.text, icon=":material/timer:"):
+                st.dataframe(step.data, hide_index=True)
 
 
 class LiveCall:
@@ -218,7 +221,9 @@ def run_turn(
             for node, update in payload.items():
                 if not update:
                     continue
-                state.update(update)
+                # Updates are per node: add up the metrics like the graph's reducer does.
+                state.update({k: v for k, v in update.items() if k != "metrics"})
+                state["metrics"] = [*state.get("metrics", []), *update.get("metrics", [])]
                 saved = saved or node == "save_turn"
                 attempts = update.get("attempts", attempts)
                 new = steps_from_update(

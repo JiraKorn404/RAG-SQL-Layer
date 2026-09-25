@@ -1,6 +1,9 @@
 """LLM and embedding factories. The only module that knows the provider (Ollama)."""
 
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from langchain_core.embeddings import Embeddings
@@ -12,6 +15,9 @@ from rag_sql.config import Settings, get_settings
 
 # Seconds to wait for the Ollama server when listing models.
 LIST_TIMEOUT_S = 10
+
+# Query embeddings remembered (see CachedEmbeddings).
+EMBED_CACHE_SIZE = 256
 
 
 @dataclass(frozen=True)
@@ -38,11 +44,49 @@ def get_chat_model(settings: Settings | None = None, **overrides: Any) -> BaseCh
     return ChatOllama(**params)
 
 
+class CachedEmbeddings(Embeddings):
+    """Remembers the most recent query embeddings.
+
+    In one turn, the retriever, the query history search and the query history save all embed
+    the same standalone question: with a shared instance, that is one call to the server.
+    """
+
+    def __init__(self, inner: Embeddings, maxsize: int = EMBED_CACHE_SIZE) -> None:
+        self.inner = inner
+        self._maxsize = maxsize
+        self._cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._lock = threading.Lock()  # the web UI embeds from several sessions at once
+
+    def embed_query(self, text: str) -> list[float]:
+        with self._lock:
+            if (vector := self._cache.get(text)) is not None:
+                self._cache.move_to_end(text)
+                return list(vector)
+        vector = self.inner.embed_query(text)
+        with self._lock:
+            self._cache[text] = list(vector)
+            if len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
+        return list(vector)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.inner.embed_documents(texts)
+
+
 def get_embeddings(settings: Settings | None = None, **overrides: Any) -> Embeddings:
+    """Embedding model. Without overrides, callers with the same model share one instance, and so
+    one query cache (see CachedEmbeddings)."""
     s = settings or get_settings()
-    params: dict[str, Any] = {"model": s.ollama_embed_model, "base_url": s.ollama_base_url}
-    params.update(overrides)
-    return OllamaEmbeddings(**params)
+    if overrides:
+        params: dict[str, Any] = {"model": s.ollama_embed_model, "base_url": s.ollama_base_url}
+        params.update(overrides)
+        return CachedEmbeddings(OllamaEmbeddings(**params))
+    return _shared_embeddings(s.ollama_embed_model, s.ollama_base_url)
+
+
+@lru_cache
+def _shared_embeddings(model: str, base_url: str) -> CachedEmbeddings:
+    return CachedEmbeddings(OllamaEmbeddings(model=model, base_url=base_url))
 
 
 def chat_model_name(llm: BaseChatModel) -> str | None:

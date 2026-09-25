@@ -27,6 +27,8 @@ dependencies = [
 [project.scripts]
 rag-sql-index = "rag_sql.retrieval:main"
 rag-sql-history = "rag_sql.query_history:main"
+rag-sql-metrics = "rag_sql.metrics:main"
+rag-sql-eval = "rag_sql.evaluation.runner:main"
 
 [project.optional-dependencies]
 # Streamlit chat UI (web.py); the only extra installed in the Docker image.

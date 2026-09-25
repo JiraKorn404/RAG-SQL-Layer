@@ -1,6 +1,7 @@
 import pytest
 
 from rag_sql.db.query import QueryResult
+from rag_sql.metrics import node_metric, summarize
 from rag_sql.steps import escape_md, steps_from_turn, steps_from_update
 from tests.conftest import TABLE_DOC, make_turn
 
@@ -107,6 +108,36 @@ def test_steps_from_saved_turn_keep_thinking() -> None:
 def test_saved_turn_shows_its_model_first() -> None:
     [first, *_] = steps_from_turn(make_turn("Q?", model="qwen3.5:9b"))
     assert (first.kind, first.text) == ("model", "qwen3.5:9b")
+
+
+def _metrics() -> dict:
+    return summarize(
+        [
+            node_metric("retrieve_context", attempt=0, ms=300, usage=None),
+            node_metric(
+                "generate_sql",
+                attempt=1,
+                ms=2200,
+                usage={"llm_ms": 2000, "load_ms": None, "input_tokens": 900, "output_tokens": 50},
+            ),
+        ]
+    )
+
+
+def test_metrics_step_after_save_turn() -> None:
+    assert _steps("save_turn", {"turn_id": None, "turn_metrics": None}) == []
+    [step] = _steps("save_turn", {"turn_id": 1, "turn_metrics": _metrics()})
+    assert (step.kind, step.text) == ("metrics", "2.5 s · 1 attempt · 950 tokens")
+    assert step.data["node"].tolist() == ["retrieve_context", "generate_sql"]
+    # Nodes without a model call have empty cells, not NaN.
+    assert step.data["tokens in"].isna().tolist() == [True, False]
+    assert str(step.data["tokens in"].dtype) == "Int64"
+
+
+def test_saved_turn_shows_its_metrics_last() -> None:
+    steps = steps_from_turn(make_turn("Q?", metrics=_metrics()))
+    assert (steps[-1].kind, steps[-1].text) == ("metrics", "2.5 s · 1 attempt · 950 tokens")
+    assert all(s.kind != "metrics" for s in steps_from_turn(make_turn("Q?")))
 
 
 def test_escape_md_keeps_dollars_literal() -> None:
