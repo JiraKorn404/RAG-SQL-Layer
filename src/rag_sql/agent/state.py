@@ -6,9 +6,9 @@ from typing import Annotated, TypedDict
 from langchain_core.documents import Document
 
 from rag_sql.db.query import QueryResult
-from rag_sql.memory import Turn
+from rag_sql.history.chat import Turn
+from rag_sql.history.queries import PastQuery
 from rag_sql.metrics import NodeMetric, TurnMetrics
-from rag_sql.query_history import PastQuery
 
 
 class AgentState(TypedDict, total=False):
@@ -20,6 +20,7 @@ class AgentState(TypedDict, total=False):
     similar_queries: list[PastQuery]  # similar past successful queries, best first
     reasoning: str | None  # model thinking behind the latest SQL, if the model produced any
     sql: str | None  # latest SQL (normalized by validate_sql once it passes)
+    no_sql: bool  # the model replied NO_SQL: not a question about the data, so nothing runs
     error: str | None  # validation or execution error of the latest SQL
     db_unavailable: bool  # the database couldn't be used (not a SQL problem), so no retry
     attempts: int  # number of SQL generations so far

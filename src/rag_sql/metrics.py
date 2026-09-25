@@ -2,18 +2,13 @@
 
 `build_graph` times every node and adds a `NodeMetric` to the state; the nodes that call the
 model also report its usage (`usage_of`). `save_turn` summarizes them into `TurnMetrics`, stored
-per node in `chat_memory.turn_metrics` (memory.py) and shown by steps.py. This module is pure.
-
-CLI (`uv run rag-sql-metrics [--days N] [--model M]`): latency, tokens and success per model.
+per node in `chat_memory.turn_metrics` (history/chat.py) and shown by ui/steps.py. This module is
+pure; `uv run rag-sql-metrics` (cli.py) reports the stored metrics per model.
 """
 
-import argparse
-import logging
 from typing import TypedDict
 
 from langchain_core.messages import BaseMessage
-
-logger = logging.getLogger(__name__)
 
 # A model load at least this long counts as a cold start (the model wasn't in memory).
 COLD_LOAD_MS = 1000
@@ -91,7 +86,8 @@ def summarize(nodes: list[NodeMetric]) -> TurnMetrics | None:
     )
 
 
-def _tokens(count: int) -> str:
+def format_tokens(count: int) -> str:
+    """A token count, e.g. "1.8k"."""
     return f"{count / 1000:.1f}k" if count >= 1000 else str(count)
 
 
@@ -102,41 +98,7 @@ def format_summary(metrics: TurnMetrics) -> str:
         parts.append(f"{metrics['attempts']} attempt{'s' if metrics['attempts'] > 1 else ''}")
     tokens = metrics["input_tokens"] + metrics["output_tokens"]
     if tokens:
-        parts.append(f"{_tokens(tokens)} tokens")
+        parts.append(f"{format_tokens(tokens)} tokens")
     if metrics["load_ms"] >= COLD_LOAD_MS:
         parts.append(f"model load {metrics['load_ms'] / 1000:.1f} s")
     return " · ".join(parts)
-
-
-def main(argv: list[str] | None = None) -> None:
-    """CLI entry point: `uv run rag-sql-metrics`."""
-    # memory.py imports this module, so it is imported here.
-    from rag_sql.db.connection import get_engine
-    from rag_sql.memory import turn_stats
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    parser = argparse.ArgumentParser(
-        prog="rag-sql-metrics", description="Latency, tokens and success of saved turns, per model."
-    )
-    parser.add_argument("--days", type=int, default=30, help="only turns of the last N days")
-    parser.add_argument("--model", help="only this chat model")
-    args = parser.parse_args(argv)
-
-    stats = turn_stats(get_engine("memory"), days=args.days, model=args.model)
-    if not stats:
-        print(f"No turns with metrics in the last {args.days} day(s).")
-        return
-    print(
-        f"{'model':<24} {'turns':>6} {'success':>8} {'attempts':>9} {'p50 s':>7} {'p95 s':>7} "
-        f"{'tokens':>8} {'cold load':>10}"
-    )
-    for s in stats:
-        print(
-            f"{s.model:<24} {s.turns:>6} {s.success_rate:>8.0%} {s.avg_attempts:>9.2f} "
-            f"{s.p50_ms / 1000:>7.1f} {s.p95_ms / 1000:>7.1f} {_tokens(round(s.avg_tokens)):>8} "
-            f"{s.cold_load_rate:>10.0%}"
-        )
-
-
-if __name__ == "__main__":
-    main()

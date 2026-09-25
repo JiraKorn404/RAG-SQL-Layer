@@ -1,6 +1,6 @@
 #!/bin/bash
 # Instacart Market Basket Analysis dataset, loaded into its own schema, imba, from
-# data/structured/Instacart Market Basket Analysis/*.csv (mounted at /data in the container):
+# data/structured/instacart/*.csv (mounted at /data in the container):
 #   departments, aisles, products, orders, order_products
 # - order_products__prior.csv and order_products__train.csv are loaded into one table,
 #   order_products; orders.eval_set tells which set an order belongs to.
@@ -17,7 +17,7 @@ psql -v ON_ERROR_STOP=1 \
     --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
     -v app_user="$APP_DB_USER" \
     -v owner="$POSTGRES_USER" <<'SQL'
-\set data_dir '/data/structured/Instacart Market Basket Analysis'
+\set data_dir '/data/structured/instacart'
 
 BEGIN;
 

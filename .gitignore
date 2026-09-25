@@ -23,7 +23,7 @@ wheels/
 notebooks/demo[0-9]*.ipynb
 
 # Large datasets (loaded into Postgres by db/init)
-data/structured/Instacart Market Basket Analysis/
+data/structured/instacart/
 
 # Evaluation results (uv run rag-sql-eval): kept locally only
-eval_results/
+evaluation/results/

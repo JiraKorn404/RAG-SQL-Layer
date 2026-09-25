@@ -10,6 +10,8 @@
 # - Questions must not repeat examples/few_shot.yaml (the model would see the answer).
 # - `history` gives earlier turns of a follow-up (question, sql, answer), passed as the graph's
 #   `history` input: no thread is created and nothing is saved.
+# - A question that isn't about the data has `no_sql: true` instead of `sql`: it is correct when
+#   the agent writes no SQL (replies NO_SQL), and scored "unneeded_sql" when it writes some.
 # Checked by tests/test_eval_cases.py; the references run in tests/test_integration.py.
 
 - id: emp-remote-salary-gap
@@ -72,3 +74,13 @@
     ORDER BY count(*) ASC
     LIMIT 1;
   tags: [imba, join, followup]
+
+- id: chat-greeting
+  question: Hello, who are you?
+  no_sql: true
+  tags: [no-sql]
+
+- id: chat-general-knowledge
+  question: What is the capital of France?
+  no_sql: true
+  tags: [no-sql]

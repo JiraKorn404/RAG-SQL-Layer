@@ -13,9 +13,9 @@ from rag_sql.db.introspect import introspect_tables
 from rag_sql.db.query import is_database_unavailable, run_query, validate_sql
 from rag_sql.evaluation.cases import load_cases
 from rag_sql.evaluation.runner import reference_results
-from rag_sql.memory import get_chat_store, new_thread_id, turn_stats
+from rag_sql.history.chat import get_chat_store, new_thread_id, turn_stats
+from rag_sql.history.queries import PostgresQueryHistory, list_examples, set_enabled
 from rag_sql.metrics import TurnMetrics, node_metric, summarize
-from rag_sql.query_history import PostgresQueryHistory, list_examples, set_enabled
 from tests.conftest import KeywordEmbeddings, make_turn
 
 pytestmark = pytest.mark.integration

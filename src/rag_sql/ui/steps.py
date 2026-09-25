@@ -1,7 +1,7 @@
 """What to show for each step of an agent run, whatever the UI.
 
 Graph updates (`graph.stream(stream_mode="updates")`) and saved turns become `Step`s here. The
-front ends, display.py (Jupyter) and web.py (Streamlit), only decide how each kind is drawn.
+front ends, notebook.py (Jupyter) and web.py (Streamlit), only decide how each kind is drawn.
 """
 
 from dataclasses import dataclass
@@ -9,9 +9,9 @@ from typing import Any, Literal
 
 import pandas as pd
 
-from rag_sql.memory import Turn
+from rag_sql.history.chat import Turn
+from rag_sql.history.queries import PastQuery
 from rag_sql.metrics import NodeMetric, TurnMetrics, format_summary
-from rag_sql.query_history import PastQuery
 
 StepKind = Literal[
     "caption",  # text: a muted status line
@@ -25,6 +25,10 @@ StepKind = Literal[
     "answer",  # text: the answer (Markdown)
     "metrics",  # text: one-line summary (time, attempts, tokens); data: pandas.DataFrame per node
 ]
+
+
+# Shown instead of the SQL when the model found the question isn't about the data.
+NO_SQL_NOTE = "No SQL: not a question about the data."
 
 
 @dataclass
@@ -108,6 +112,8 @@ def steps_from_update(
         steps = []
         if reasoning := update.get("reasoning"):
             steps.append(Step("thinking", reasoning, label=thinking_label(node, attempt)))
+        if update.get("no_sql"):
+            return [*steps, Step("caption", NO_SQL_NOTE)]
         label = "SQL" if attempt <= 1 else f"SQL (attempt {attempt})"
         return [*steps, Step("sql", update.get("sql") or "", label=label)]
     if node in ("validate_sql", "execute_sql") and update.get("error"):
@@ -146,6 +152,9 @@ def steps_from_turn(turn: Turn) -> list[Step]:
         steps.append(Step("thinking", turn["sql_reasoning"], label="Thinking"))
     if turn["sql"]:
         steps.append(Step("sql", turn["sql"], label="SQL"))
+    elif not turn["error"] and turn["answer"]:
+        # Answered without SQL and without an error: the model replied NO_SQL.
+        steps.append(Step("caption", NO_SQL_NOTE))
     if turn["row_count"] is not None:
         steps.append(Step("caption", f"{turn['row_count']} row(s) · result rows aren't saved"))
     if turn["error"]:

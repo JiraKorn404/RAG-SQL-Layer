@@ -1,4 +1,4 @@
--- Employees table, loaded and cleaned from data/structured/Employees_raw_Data.csv
+-- Employees table, loaded and cleaned from data/structured/employees.csv
 -- (mounted at /data in the container). Runs automatically on first start with an empty data
 -- volume. It is idempotent (reloads the table), so on an existing database re-run it with:
 --   docker compose exec postgres psql -v ON_ERROR_STOP=1 -U postgres -d <POSTGRES_DB> -f /docker-entrypoint-initdb.d/03-employees.sql
@@ -41,7 +41,7 @@ CREATE TEMP TABLE employees_raw (
     remote_work        text
 ) ON COMMIT DROP;
 
-COPY employees_raw FROM '/data/structured/Employees_raw_Data.csv' WITH (FORMAT csv, HEADER true);
+COPY employees_raw FROM '/data/structured/employees.csv' WITH (FORMAT csv, HEADER true);
 
 TRUNCATE employees RESTART IDENTITY;
 

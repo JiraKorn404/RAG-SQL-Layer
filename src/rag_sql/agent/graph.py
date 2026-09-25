@@ -16,16 +16,21 @@ from rag_sql.agent.state import AgentState
 from rag_sql.config import Settings, get_settings
 from rag_sql.db.connection import get_engine
 from rag_sql.db.query import QueryResult, run_query
+from rag_sql.history.chat import ChatStore, get_chat_store
+from rag_sql.history.queries import QueryHistory, get_query_history
 from rag_sql.llm import chat_model_name, get_chat_model
-from rag_sql.memory import ChatStore, get_chat_store
 from rag_sql.metrics import node_metric
-from rag_sql.query_history import QueryHistory, get_query_history
 from rag_sql.retrieval import get_retriever
 
 
 def _should_retry(state: AgentState, max_retries: int) -> bool:
     # attempts counts generations; the first one is not a retry.
     return state.get("attempts", 0) <= max_retries
+
+
+def route_after_generate(state: AgentState) -> Literal["validate_sql", "answer"]:
+    # NO_SQL: not a question about the data, so there is nothing to validate or run.
+    return "answer" if state.get("no_sql") else "validate_sql"
 
 
 def route_after_validate(
@@ -123,7 +128,7 @@ def build_graph(
     graph.add_edge("condense_question", "retrieve_context")
     graph.add_edge("retrieve_context", "find_similar_queries")
     graph.add_edge("find_similar_queries", "generate_sql")
-    graph.add_edge("generate_sql", "validate_sql")
+    graph.add_conditional_edges("generate_sql", route_after_generate, ["validate_sql", "answer"])
     graph.add_conditional_edges(
         "validate_sql",
         partial(route_after_validate, max_retries=s.max_sql_retries),

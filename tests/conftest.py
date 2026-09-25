@@ -9,9 +9,9 @@ from langchain_core.runnables import RunnableLambda
 
 from rag_sql.config import Settings
 from rag_sql.db.query import QueryResult
-from rag_sql.memory import InMemoryChatStore, Turn
+from rag_sql.history.chat import InMemoryChatStore, Turn
+from rag_sql.history.queries import InMemoryQueryHistory
 from rag_sql.metrics import TurnMetrics
-from rag_sql.query_history import InMemoryQueryHistory
 
 TABLE_DOC = Document(
     page_content="Table employees\n  emp_name TEXT\n  salary NUMERIC(12, 2)",

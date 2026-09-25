@@ -1,23 +1,34 @@
 """Graph nodes. Each takes the state (plus injected dependencies) and returns a partial update.
 
 Nodes that call the model also return `llm_usage` (metrics.usage_of). It never reaches the state:
-the timing wrapper in graph.py moves it into the node's metric.
+the timing wrapper in graph.py moves it into the node's metric. Prompt inputs are built, and model
+replies parsed, in formatting.py.
 """
 
 import logging
-import re
 from collections.abc import Callable
-from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage
 from langchain_core.runnables import Runnable
 from sqlalchemy.exc import DBAPIError
 
+from rag_sql.agent.formatting import (
+    ANSWER_MAX_ROWS,
+    extract_sql,
+    format_examples,
+    format_history,
+    format_rows,
+    format_schema,
+    format_similar_queries,
+    format_table_names,
+    is_no_sql,
+    split_reasoning,
+)
 from rag_sql.agent.prompts import (
     ANSWER_HISTORY,
     ANSWER_PROMPT,
+    CHAT_REPLY_PROMPT,
     CONDENSE_PROMPT,
     SIMILAR_QUERIES,
     SQL_GENERATION_PROMPT,
@@ -27,103 +38,11 @@ from rag_sql.agent.prompts import (
 from rag_sql.agent.state import AgentState
 from rag_sql.db.query import QueryResult, SQLValidationError, is_database_unavailable
 from rag_sql.db.query import validate_sql as check_sql
-from rag_sql.memory import ChatStore, Turn
+from rag_sql.history.chat import ChatStore, Turn
+from rag_sql.history.queries import QueryHistory, normalize_question
 from rag_sql.metrics import summarize, usage_of
-from rag_sql.query_history import PastQuery, QueryHistory, normalize_question
 
 logger = logging.getLogger(__name__)
-
-# Rows of the SQL result shown to the model when writing the answer.
-ANSWER_MAX_ROWS = 50
-
-# Characters of each earlier answer shown to the model.
-HISTORY_ANSWER_CHARS = 500
-
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
-_SQL_BLOCK_RE = re.compile(r"```sql\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-_ANY_BLOCK_RE = re.compile(r"```\w*\s*(.*?)```", re.DOTALL)
-
-
-# --- helpers ---------------------------------------------------------------------------------
-
-
-def split_reasoning(message: BaseMessage) -> tuple[str | None, str]:
-    """Return (reasoning, content) from a model reply.
-
-    Reasoning comes from `additional_kwargs["reasoning_content"]` (ChatOllama with
-    reasoning=True), or from inline <think>...</think> tags some models emit.
-    """
-    content = message.text
-    reasoning = message.additional_kwargs.get("reasoning_content") or None
-    inline = _THINK_RE.findall(content)
-    if inline:
-        content = _THINK_RE.sub("", content)
-        reasoning = reasoning or "\n".join(t.strip() for t in inline)
-    return (reasoning.strip() if reasoning else None), content.strip()
-
-
-def extract_sql(content: str) -> str:
-    """Pull the SQL out of a model reply: last ```sql block, else last code block, else raw."""
-    for pattern in (_SQL_BLOCK_RE, _ANY_BLOCK_RE):
-        blocks = pattern.findall(content)
-        if blocks:
-            return blocks[-1].strip()
-    return content.strip()
-
-
-def format_schema(context: list[Document]) -> str:
-    tables = [d.page_content for d in context if d.metadata.get("kind") == "table"]
-    return "\n\n".join(tables) or "(no schema found)"
-
-
-def format_examples(context: list[Document]) -> str:
-    examples = [
-        f"Question: {d.page_content}\n```sql\n{d.metadata['sql']}\n```"
-        for d in context
-        if d.metadata.get("kind") == "example"
-    ]
-    return "\n\n".join(examples) or "(none)"
-
-
-def format_similar_queries(queries: list[PastQuery]) -> str:
-    return "\n\n".join(f"Question: {q.question}\n```sql\n{q.sql}\n```" for q in queries)
-
-
-def format_rows(result: QueryResult, max_rows: int = ANSWER_MAX_ROWS) -> str:
-    """Markdown table of the first `max_rows` rows."""
-    if not result.columns:
-        return "(no columns)"
-    if not result.rows:
-        return "(no rows)"
-
-    def cell(value: Any) -> str:
-        return "NULL" if value is None else str(value).replace("|", "\\|").replace("\n", " ")
-
-    lines = [
-        "| " + " | ".join(result.columns) + " |",
-        "|" + "---|" * len(result.columns),
-    ]
-    lines += ["| " + " | ".join(cell(v) for v in row) + " |" for row in result.rows[:max_rows]]
-    return "\n".join(lines)
-
-
-def format_history(history: list[Turn], *, sql: bool = False, answers: bool = True) -> str:
-    """Earlier turns, oldest first: each question, plus its SQL and/or answer."""
-    blocks = []
-    for turn in history:
-        lines = [f"Question: {turn['standalone'] or turn['question']}"]
-        if sql:
-            if turn["sql"]:
-                lines.append(f"```sql\n{turn['sql']}\n```")
-            else:
-                lines.append(f"(no working SQL; error: {turn['error'] or 'unknown'})")
-        if answers:
-            text = turn["answer"]
-            if len(text) > HISTORY_ANSWER_CHARS:
-                text = text[:HISTORY_ANSWER_CHARS].rstrip() + " …"
-            lines.append(f"Answer: {text}")
-        blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
 
 
 def current_question(state: AgentState) -> str:
@@ -186,6 +105,7 @@ def find_similar_queries(
 
 
 def generate_sql(state: AgentState, *, llm: BaseChatModel, row_limit: int) -> dict:
+    """Write SQL for the question, or set `no_sql` (and no SQL) when the model replied NO_SQL."""
     feedback = ""
     if state.get("error") and state.get("sql") is not None:
         feedback = SQL_RETRY_FEEDBACK.format(sql=state["sql"], error=state["error"])
@@ -211,9 +131,11 @@ def generate_sql(state: AgentState, *, llm: BaseChatModel, row_limit: int) -> di
         }
     )
     reasoning, content = split_reasoning(message)
+    no_sql = is_no_sql(content)
     return {
         "reasoning": reasoning,
-        "sql": extract_sql(content),
+        "sql": None if no_sql else extract_sql(content),
+        "no_sql": no_sql,
         "error": None,
         "result": None,
         "attempts": state.get("attempts", 0) + 1,
@@ -248,6 +170,8 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
             ),
             "answer_reasoning": None,
         }
+    if state.get("no_sql"):
+        return chat_reply(state, llm=llm)
     if result is None:
         # Retries exhausted: report the failure without another model call.
         return {
@@ -273,6 +197,23 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
             "sql": state["sql"],
             "row_summary": row_summary,
             "rows": format_rows(result),
+        }
+    )
+    reasoning, content = split_reasoning(message)
+    return {"answer": content, "answer_reasoning": reasoning, "llm_usage": usage_of(message)}
+
+
+def chat_reply(state: AgentState, *, llm: BaseChatModel) -> dict:
+    """The answer to a message that isn't about the data: no SQL ran, so no result to report.
+
+    Part of the answer node (its update and streamed tokens are the answer's), not a node itself.
+    """
+    history = state.get("history") or []
+    message = (CHAT_REPLY_PROMPT | llm).invoke(
+        {
+            "tables": format_table_names(state.get("context", [])),
+            "history": ANSWER_HISTORY.format(turns=format_history(history)) if history else "",
+            "question": state["question"],
         }
     )
     reasoning, content = split_reasoning(message)

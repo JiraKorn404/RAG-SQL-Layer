@@ -1,6 +1,6 @@
 import pytest
 
-from rag_sql.query_history import InMemoryQueryHistory, PastQuery, normalize_question, pick_best
+from rag_sql.history.queries import InMemoryQueryHistory, PastQuery, normalize_question, pick_best
 from tests.conftest import KeywordEmbeddings
 
 

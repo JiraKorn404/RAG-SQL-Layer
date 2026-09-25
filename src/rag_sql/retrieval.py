@@ -133,14 +133,3 @@ def get_retriever(
         return tables + examples
 
     return RunnableLambda(retrieve, name="schema_retriever")
-
-
-def main() -> None:
-    """CLI entry point: `uv run rag-sql-index`."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    count = build_index()
-    logger.info("Indexed %d documents into collection %r", count, get_settings().vector_collection)
-
-
-if __name__ == "__main__":
-    main()

@@ -5,8 +5,9 @@ from streamlit.testing.v1 import AppTest
 
 from rag_sql.agent.graph import build_graph
 from rag_sql.llm import ChatModelInfo
-from rag_sql.steps import Step
-from rag_sql.web import INTERRUPTED, model_label, run_turn
+from rag_sql.ui.steps import Step
+from rag_sql.ui.web import model_label
+from rag_sql.ui.web_chat import INTERRUPTED, run_turn
 from tests.conftest import fake_llm
 
 SQL_REPLY = AIMessage(
@@ -132,7 +133,7 @@ def test_failed_save_of_unfinished_run_is_only_logged(caplog) -> None:
 
 APP = """
 import streamlit as st
-from rag_sql.web import main
+from rag_sql.ui.web import main
 
 main(**st.session_state["deps"])
 """

@@ -2,8 +2,8 @@ import re
 
 import pytest
 
-from rag_sql import display as notebook
 from rag_sql.agent.graph import build_graph
+from rag_sql.ui import notebook
 from tests.conftest import fake_llm
 
 

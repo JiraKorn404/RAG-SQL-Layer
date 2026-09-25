@@ -8,7 +8,12 @@ from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableLambda
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
-from rag_sql.agent.graph import build_graph, route_after_execute, route_after_validate
+from rag_sql.agent.graph import (
+    build_graph,
+    route_after_execute,
+    route_after_generate,
+    route_after_validate,
+)
 from rag_sql.db.query import QueryResult
 from tests.conftest import EXAMPLE_DOC, TABLE_DOC, fake_llm
 
@@ -37,6 +42,11 @@ def test_route_after_validate(state: dict, expected: str) -> None:
 )
 def test_route_after_execute(state: dict, expected: str) -> None:
     assert route_after_execute(state, max_retries=2) == expected
+
+
+def test_route_after_generate() -> None:
+    assert route_after_generate({"sql": "SELECT 1", "no_sql": False}) == "validate_sql"
+    assert route_after_generate({"sql": None, "no_sql": True}) == "answer"
 
 
 class PromptRecorder(BaseCallbackHandler):
@@ -321,6 +331,39 @@ def test_empty_result_is_not_saved_as_example(settings, retriever, stores, query
 
     assert state["example_saved"] is False
     assert query_history.search("Average salary of remote employees?", 5, 0.0) == []
+
+
+def test_no_sql_question_runs_nothing_and_saves_no_example(
+    settings, retriever, chat_store, stores, query_history
+) -> None:
+    def must_not_run(_sql: str) -> QueryResult:
+        raise AssertionError("no query should run")
+
+    llm = fake_llm("NO_SQL", "Hi! I answer questions about the employees table.")
+    graph = build_graph(
+        llm=llm, retriever=retriever, query_runner=must_not_run, **stores, settings=settings
+    )
+    recorder = PromptRecorder()
+    order, state = _nodes_run(graph, "hello, who are you?", "t1", [recorder])
+
+    assert order == [
+        "load_history",
+        "condense_question",
+        "retrieve_context",
+        "find_similar_queries",
+        "generate_sql",
+        "answer",
+        "save_turn",
+        "save_query_example",
+    ]
+    assert state["answer"] == "Hi! I answer questions about the employees table."
+    assert (state["no_sql"], state["sql"], state["attempts"]) == (True, None, 1)
+    # The reply is written from the table names, not from a query result.
+    assert "Tables: employees" in recorder.prompts[1]
+    [turn] = chat_store.load("t1")
+    assert (turn["sql"], turn["error"], turn["row_count"]) == (None, None, None)
+    assert state["example_saved"] is False
+    assert query_history.search("hello, who are you?", 5, 0.0) == []
 
 
 class OllamaLikeModel(BaseChatModel):

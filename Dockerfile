@@ -27,6 +27,6 @@ USER app
 
 EXPOSE 8501
 # Code is baked into the image, so there is nothing to watch for reloads.
-CMD ["streamlit", "run", "src/rag_sql/web.py", \
+CMD ["streamlit", "run", "src/rag_sql/ui/web.py", \
      "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true", \
      "--server.fileWatcherType=none"]

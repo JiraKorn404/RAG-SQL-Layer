@@ -26,7 +26,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # Streamlit chat UI (src/rag_sql/web.py). Rebuild after code changes: docker compose up -d --build
+  # Streamlit chat UI (src/rag_sql/ui/web.py). Rebuild after code changes: docker compose up -d --build
   web:
     build: .
     image: rag-sql-web

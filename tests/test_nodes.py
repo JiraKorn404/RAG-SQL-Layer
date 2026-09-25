@@ -4,49 +4,10 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from rag_sql.agent import nodes
 from rag_sql.db.query import QueryResult
-from rag_sql.memory import InMemoryChatStore
+from rag_sql.history.chat import InMemoryChatStore
+from rag_sql.history.queries import InMemoryQueryHistory
 from rag_sql.metrics import node_metric
-from rag_sql.query_history import InMemoryQueryHistory, PastQuery
 from tests.conftest import EXAMPLE_DOC, TABLE_DOC, KeywordEmbeddings, fake_llm, make_turn
-
-
-def test_extract_sql_prefers_sql_block() -> None:
-    content = "Here you go:\n```sql\nSELECT 1\n```\nand\n```sql\nSELECT 2\n```"
-    assert nodes.extract_sql(content) == "SELECT 2"
-
-
-def test_extract_sql_falls_back_to_any_block_then_raw() -> None:
-    assert nodes.extract_sql("```\nSELECT 3\n```") == "SELECT 3"
-    assert nodes.extract_sql("  SELECT 4  ") == "SELECT 4"
-
-
-def test_split_reasoning_from_additional_kwargs() -> None:
-    msg = AIMessage(
-        content="```sql\nSELECT 1\n```", additional_kwargs={"reasoning_content": " hmm "}
-    )
-    assert nodes.split_reasoning(msg) == ("hmm", "```sql\nSELECT 1\n```")
-
-
-def test_split_reasoning_from_think_tags() -> None:
-    msg = AIMessage(content="<think>plan it</think>\nSELECT 1")
-    assert nodes.split_reasoning(msg) == ("plan it", "SELECT 1")
-
-
-def test_split_reasoning_none() -> None:
-    assert nodes.split_reasoning(AIMessage(content="SELECT 1")) == (None, "SELECT 1")
-
-
-def test_format_schema_and_examples_split_by_kind() -> None:
-    context = [TABLE_DOC, EXAMPLE_DOC]
-    assert nodes.format_schema(context) == TABLE_DOC.page_content
-    assert "ORDER BY salary DESC" in nodes.format_examples(context)
-    assert nodes.format_examples([TABLE_DOC]) == "(none)"
-
-
-def test_format_rows_markdown_table() -> None:
-    result = QueryResult(columns=["a", "b"], rows=[(1, None), (2, "x|y")])
-    assert nodes.format_rows(result) == "| a | b |\n|---|---|\n| 1 | NULL |\n| 2 | x\\|y |"
-    assert nodes.format_rows(QueryResult(columns=["a"])) == "(no rows)"
 
 
 def test_generate_sql_increments_attempts_and_clears_error() -> None:
@@ -64,10 +25,32 @@ def test_generate_sql_increments_attempts_and_clears_error() -> None:
     assert update == {
         "reasoning": "Use employees.",
         "sql": "SELECT emp_name FROM employees",
+        "no_sql": False,
         "error": None,
         "result": None,
         "attempts": 2,
         "llm_usage": None,  # the fake model reports no usage
+    }
+
+
+def test_generate_sql_no_sql_reply_sets_the_flag_without_sql() -> None:
+    reply = AIMessage(content="NO_SQL", additional_kwargs={"reasoning_content": "A greeting."})
+    update = nodes.generate_sql(
+        {"question": "hello, who are you?", "context": [TABLE_DOC]},
+        llm=fake_llm(reply),
+        row_limit=10,
+    )
+    assert (update["sql"], update["no_sql"], update["attempts"]) == (None, True, 1)
+    assert update["reasoning"] == "A greeting."
+
+
+def test_answer_to_no_sql_replies_without_a_result() -> None:
+    llm = fake_llm("Hi! I answer questions about the employees table.")
+    state = {"question": "hello, who are you?", "no_sql": True, "context": [TABLE_DOC]}
+    assert nodes.answer(state, llm=llm) == {
+        "answer": "Hi! I answer questions about the employees table.",
+        "answer_reasoning": None,
+        "llm_usage": None,
     }
 
 
@@ -158,21 +141,6 @@ def test_answer_reports_model_usage() -> None:
 
 
 # --- chat history ----------------------------------------------------------------------------
-
-
-def test_format_history_sql_and_answers() -> None:
-    history = [make_turn("q1", sql="SELECT 1", answer="a1"), make_turn("q2", sql=None)]
-    with_sql = nodes.format_history(history, sql=True, answers=False)
-    assert with_sql == (
-        "Question: q1\n```sql\nSELECT 1\n```\n\nQuestion: q2\n(no working SQL; error: boom)"
-    )
-    assert nodes.format_history(history[:1]) == "Question: q1\nAnswer: a1"
-
-
-def test_format_history_truncates_long_answers() -> None:
-    text = nodes.format_history([make_turn("q", answer="x" * 1000)])
-    assert text.endswith(" …")
-    assert len(text) < nodes.HISTORY_ANSWER_CHARS + 50
 
 
 def test_load_history_from_store(chat_store) -> None:
@@ -274,13 +242,6 @@ def test_save_turn_failure_is_logged_not_raised(caplog) -> None:
 
 
 # --- query history ---------------------------------------------------------------------------
-
-
-def test_format_similar_queries() -> None:
-    queries = [PastQuery("q1", "SELECT 1", 0.9), PastQuery("q2", "SELECT 2", 0.8)]
-    assert nodes.format_similar_queries(queries) == (
-        "Question: q1\n```sql\nSELECT 1\n```\n\nQuestion: q2\n```sql\nSELECT 2\n```"
-    )
 
 
 def test_find_similar_queries_drops_curated_duplicates(query_history) -> None:

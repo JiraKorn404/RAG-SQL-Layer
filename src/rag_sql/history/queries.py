@@ -3,18 +3,10 @@
 When a saved turn's SQL runs and returns rows, its standalone question is embedded and stored
 with the SQL in `chat_memory.query_examples` (created by db/init/04-chat-memory.sh), through the
 chat role (CHAT_DB_USER), which can only read and insert. Before writing SQL, the agent retrieves
-the most similar ones. The agent's read-only role has no access to the table.
-
-CLI (`uv run rag-sql-history`):
-  backfill             embed successful turns from chat history that have no example yet
-                       (also after changing OLLAMA_EMBED_MODEL)
-  list [--all] [--sql] show stored examples (enabled only, unless --all)
-  disable ID [ID ...]  exclude examples from retrieval; they are never re-added (admin role)
-  enable ID [ID ...]   include them again (admin role)
+the most similar ones. The agent's read-only role has no access to the table. Stored examples are
+managed with `uv run rag-sql-history` (cli.py).
 """
 
-import argparse
-import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,8 +18,6 @@ from sqlalchemy import Engine, bindparam, text
 from rag_sql.config import Settings, get_settings
 from rag_sql.db.connection import get_engine
 from rag_sql.llm import get_embeddings
-
-logger = logging.getLogger(__name__)
 
 # Candidates fetched per result wanted, so duplicates and weak matches can be dropped.
 _OVERFETCH = 3
@@ -228,46 +218,3 @@ def set_enabled(engine: Engine, ids: list[int], enabled: bool) -> int:
             ).bindparams(bindparam("ids", expanding=True)),
             {"enabled": enabled, "ids": ids},
         ).rowcount
-
-
-def main(argv: list[str] | None = None) -> None:
-    """CLI entry point: `uv run rag-sql-history <command>`."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    parser = argparse.ArgumentParser(
-        prog="rag-sql-history", description="Manage the query history used as SQL examples."
-    )
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("backfill", help="embed successful chat turns that have no example yet")
-    list_cmd = commands.add_parser("list", help="show stored examples, newest first")
-    list_cmd.add_argument("--all", action="store_true", help="include disabled examples")
-    list_cmd.add_argument("--sql", action="store_true", help="print each example's SQL")
-    list_cmd.add_argument("--limit", type=int, default=50)
-    for name in ("disable", "enable"):
-        cmd = commands.add_parser(name, help=f"{name} examples by id")
-        cmd.add_argument("ids", type=int, nargs="+")
-    args = parser.parse_args(argv)
-
-    s = get_settings()
-    if args.command == "backfill":
-        added = get_query_history(s).backfill()
-        logger.info("Added %d example(s) for embedding model %r", added, s.ollama_embed_model)
-    elif args.command == "list":
-        examples = list_examples(
-            get_engine("memory", settings=s), include_disabled=args.all, limit=args.limit
-        )
-        for e in examples:
-            state = "on " if e.enabled else "off"
-            print(
-                f"{e.id:>6}  {state}  {e.row_count:>6} rows  {e.created_at:%Y-%m-%d}  {e.question}"
-            )
-            if args.sql:
-                print("        " + e.sql.replace("\n", "\n        "))
-        if not examples:
-            print("No examples stored.")
-    else:
-        changed = set_enabled(get_engine("admin", settings=s), args.ids, args.command == "enable")
-        logger.info("%sd %d of %d example(s)", args.command.capitalize(), changed, len(args.ids))
-
-
-if __name__ == "__main__":
-    main()

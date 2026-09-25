@@ -24,9 +24,11 @@ from sqlglot import exp
 from rag_sql.db.query import DIALECT, QueryResult
 
 Outcome = Literal[
-    "correct",  # same values in the same shape
+    "correct",  # same values in the same shape (or NO_SQL for a question not about the data)
     "correct_extra_columns",  # every reference column is there, plus more
     "wrong_result",  # the SQL ran, but the result differs
+    "declined",  # the agent replied NO_SQL to a question about the data
+    "unneeded_sql",  # the agent wrote SQL for a question that isn't about the data
     "sql_failed",  # no SQL ran: retries ran out
     "db_unavailable",  # the database couldn't be used
     "agent_error",  # the run raised an exception

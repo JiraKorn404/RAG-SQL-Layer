@@ -1,4 +1,4 @@
-from rag_sql.memory import InMemoryChatStore, new_thread_id
+from rag_sql.history.chat import InMemoryChatStore, new_thread_id
 from tests.conftest import make_turn
 
 

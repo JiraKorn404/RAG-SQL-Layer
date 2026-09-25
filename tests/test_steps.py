@@ -2,7 +2,7 @@ import pytest
 
 from rag_sql.db.query import QueryResult
 from rag_sql.metrics import node_metric, summarize
-from rag_sql.steps import escape_md, steps_from_turn, steps_from_update
+from rag_sql.ui.steps import NO_SQL_NOTE, escape_md, steps_from_turn, steps_from_update
 from tests.conftest import TABLE_DOC, make_turn
 
 
@@ -39,6 +39,22 @@ def test_retry_generation_is_labelled_with_attempt() -> None:
         ("thinking", "Thinking (attempt 2)"),
         ("sql", "SQL (attempt 2)"),
     ]
+
+
+def test_no_sql_generation_shows_a_note_instead_of_sql() -> None:
+    update = {"sql": None, "no_sql": True, "reasoning": "A greeting.", "attempts": 1}
+    steps = _steps("generate_sql", update)
+    assert [(s.kind, s.text) for s in steps] == [
+        ("thinking", "A greeting."),
+        ("caption", NO_SQL_NOTE),
+    ]
+
+
+def test_saved_no_sql_turn_shows_the_note() -> None:
+    turn = make_turn("hello?", sql=None, answer="Hi!")
+    turn["error"] = None  # answered without SQL and without an error: a NO_SQL reply
+    steps = steps_from_turn(turn)
+    assert [(s.kind, s.text) for s in steps] == [("caption", NO_SQL_NOTE), ("answer", "Hi!")]
 
 
 @pytest.mark.parametrize(

@@ -192,7 +192,8 @@ def get_chat_store(settings: Settings | None = None) -> ChatStore:
 class ModelStats:
     model: str
     turns: int
-    success_rate: float  # share of turns whose SQL ran without error
+    # Share of turns answered without error: their SQL ran, or no SQL was needed (NO_SQL).
+    success_rate: float
     avg_attempts: float
     p50_ms: float
     p95_ms: float
@@ -211,7 +212,7 @@ def turn_stats(engine: Engine, *, days: int = 30, model: str | None = None) -> l
                 " bool_or(coalesce(load_ms, 0) >= :cold_ms) AS cold_load"
                 " FROM chat_memory.turn_metrics GROUP BY turn_id) "
                 "SELECT coalesce(t.model, 'unknown') AS model, count(*) AS turns,"
-                " avg((t.sql IS NOT NULL AND t.error IS NULL)::int) AS success_rate,"
+                " avg((t.error IS NULL)::int) AS success_rate,"
                 " avg(p.attempts) AS avg_attempts,"
                 " percentile_cont(0.5) WITHIN GROUP (ORDER BY p.total_ms) AS p50_ms,"
                 " percentile_cont(0.95) WITHIN GROUP (ORDER BY p.total_ms) AS p95_ms,"

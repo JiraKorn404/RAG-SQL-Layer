@@ -13,8 +13,8 @@ from langgraph.graph.state import CompiledStateGraph
 
 from rag_sql.agent.graph import build_graph
 from rag_sql.config import get_settings
-from rag_sql.memory import ChatStore, get_chat_store, new_thread_id
-from rag_sql.steps import Step, escape_md, steps_from_update
+from rag_sql.history.chat import ChatStore, get_chat_store, new_thread_id
+from rag_sql.ui.steps import Step, escape_md, steps_from_update
 
 # Rows rendered in the notebook table; the full result stays in the returned state.
 DISPLAY_MAX_ROWS = 50

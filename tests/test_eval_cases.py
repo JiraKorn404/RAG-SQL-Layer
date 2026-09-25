@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from rag_sql.evaluation.cases import EvalCase, load_cases, select_cases
-from rag_sql.query_history import normalize_question
+from rag_sql.history.queries import normalize_question
 from rag_sql.retrieval import load_examples
 
 
@@ -14,6 +14,8 @@ def test_the_committed_cases_are_valid() -> None:
     few_shot = {normalize_question(ex["question"]) for ex in load_examples()}
     assert not few_shot & {normalize_question(c.question) for c in cases}
     assert all(c.tags for c in cases)
+    # Questions that aren't about the data have no reference SQL.
+    assert {c.id for c in cases if c.sql is None} == {"chat-greeting", "chat-general-knowledge"}
 
 
 def test_follow_up_history_becomes_turns() -> None:
@@ -33,7 +35,10 @@ def _write(tmp_path: Path, text: str) -> Path:
 @pytest.mark.parametrize(
     ("text", "message"),
     [
-        ("- id: a\n  question: Q?\n", "needs non-empty"),
+        ("- id: a\n  sql: SELECT 1\n", "needs non-empty"),
+        ("- id: a\n  question: Q?\n", "either 'sql' or 'no_sql: true'"),
+        ("- {id: a, question: 'Q?', sql: SELECT 1, no_sql: true}\n", "either 'sql'"),
+        ("- {id: a, question: 'Q?', no_sql: yes-please}\n", "either 'sql'"),
         (
             "- {id: a, question: 'Q1?', sql: SELECT 1}\n"
             "- {id: a, question: 'Q2?', sql: SELECT 2}\n",
