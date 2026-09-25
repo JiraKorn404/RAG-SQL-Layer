@@ -1,13 +1,14 @@
 """Command-line entry points ([project.scripts] in pyproject.toml). Output is ASCII only.
 
 rag-sql-index                      rebuild the schema + few-shot index (retrieval.py)
-rag-sql-history backfill           embed successful chat turns that have no example yet
-                                   (also after changing OLLAMA_EMBED_MODEL)
+rag-sql-history backfill           embed the stored examples for the current embedding
+                                   model (after changing OLLAMA_EMBED_MODEL)
 rag-sql-history list [--all] [--sql]
                                    show stored examples (enabled only, unless --all)
 rag-sql-history disable|enable ID...
                                    exclude examples from retrieval, or include them again
-                                   (admin role); disabled ones are never re-added
+                                   (admin role); disabled ones are never re-added. Examples
+                                   are added with a thumbs up in the web UI, and hidden there
 rag-sql-metrics [--days N] [--model M]
                                    latency, tokens and success of saved turns, per model
 rag-sql-eval run [--models A,B] [--tags T,U] [--limit N] [--repeat K] [--with-history]
@@ -57,7 +58,9 @@ def history_main(argv: list[str] | None = None) -> None:
         prog="rag-sql-history", description="Manage the query history used as SQL examples."
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("backfill", help="embed successful chat turns that have no example yet")
+    commands.add_parser(
+        "backfill", help="embed the stored examples for the current embedding model"
+    )
     list_cmd = commands.add_parser("list", help="show stored examples, newest first")
     list_cmd.add_argument("--all", action="store_true", help="include disabled examples")
     list_cmd.add_argument("--sql", action="store_true", help="print each example's SQL")
@@ -70,7 +73,7 @@ def history_main(argv: list[str] | None = None) -> None:
     s = get_settings()
     if args.command == "backfill":
         added = get_query_history(s).backfill()
-        logger.info("Added %d example(s) for embedding model %r", added, s.ollama_embed_model)
+        logger.info("Embedded %d example(s) for model %r", added, s.ollama_embed_model)
     elif args.command == "list":
         examples = list_examples(
             get_engine("memory", settings=s), include_disabled=args.all, limit=args.limit

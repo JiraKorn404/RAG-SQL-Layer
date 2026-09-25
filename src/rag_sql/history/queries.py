@@ -1,16 +1,16 @@
-"""Query history: successful past questions + SQL, retrieved by vector similarity as examples.
+"""Query history: past questions + SQL a user marked as good, retrieved by similarity as examples.
 
-When a saved turn's SQL runs and returns rows, its standalone question is embedded and stored
+When a user gives a turn a thumbs up in the web UI, its standalone question is embedded and stored
 with the SQL in `chat_memory.query_examples` (created by db/init/04-chat-memory.sh), through the
-chat role (CHAT_DB_USER), which can only read and insert. Before writing SQL, the agent retrieves
-the most similar ones. The agent's read-only role has no access to the table. Stored examples are
-managed with `uv run rag-sql-history` (cli.py).
+chat role (CHAT_DB_USER), which can read and insert, and set `enabled` to hide an example. Before
+writing SQL, the agent retrieves the most similar ones. The agent's read-only role has no access
+to the table. Stored examples are also managed with `uv run rag-sql-history` (cli.py).
 """
 
 import math
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Protocol
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Literal, Protocol
 
 from langchain_core.embeddings import Embeddings
 from sqlalchemy import Engine, bindparam, text
@@ -30,13 +30,40 @@ class PastQuery:
     similarity: float  # cosine similarity of the questions, 1.0 = same direction
 
 
+@dataclass(frozen=True)
+class Example:
+    """A stored question + SQL pair, once, whatever the embedding models it is stored for."""
+
+    id: int  # id of its first row
+    question: str
+    sql: str
+    created_at: datetime
+
+
+# Whether a (question, SQL) pair is stored: "saved" (retrieved as an example) or "hidden" (never
+# retrieved, and never re-added). Pairs that aren't stored have no status.
+ExampleStatus = Literal["saved", "hidden"]
+
+
 class QueryHistory(Protocol):
     def add(self, question: str, sql: str, row_count: int, turn_id: int | None = None) -> bool:
-        """Store a successful query. Returns False when skipped: already stored, or disabled."""
+        """Store a successful query. Returns False when skipped: already stored, or hidden."""
         ...
 
     def search(self, question: str, k: int, min_similarity: float) -> list[PastQuery]:
         """Up to `k` past queries at least `min_similarity` similar, best first."""
+        ...
+
+    def examples(self) -> list[Example]:
+        """The pairs that are retrieved (not hidden), newest first."""
+        ...
+
+    def status(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], ExampleStatus]:
+        """The status of each stored (question, SQL) pair; pairs not stored are left out."""
+        ...
+
+    def hide(self, question: str, sql: str) -> int:
+        """Stop retrieving a pair, under every embedding model. Returns the rows changed."""
         ...
 
 
@@ -75,6 +102,7 @@ class _Row:
     sql: str
     vector: list[float]
     enabled: bool = True
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryQueryHistory:
@@ -99,6 +127,23 @@ class InMemoryQueryHistory:
             PastQuery(r.question, r.sql, _cosine(vector, r.vector)) for r in self._rows if r.enabled
         ]
         return pick_best(candidates, k, min_similarity)
+
+    def examples(self) -> list[Example]:
+        return [
+            Example(r.id, r.question, r.sql, r.created_at)
+            for r in reversed(self._rows)
+            if r.enabled
+        ]
+
+    def status(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], ExampleStatus]:
+        stored = {(r.question, r.sql): r.enabled for r in self._rows}
+        return {p: "saved" if stored[p] else "hidden" for p in pairs if p in stored}
+
+    def hide(self, question: str, sql: str) -> int:
+        rows = [r for r in self._rows if r.question == question and r.sql == sql and r.enabled]
+        for row in rows:
+            row.enabled = False
+        return len(rows)
 
     def set_enabled(self, ids: list[int], enabled: bool) -> None:
         for row in self._rows:
@@ -155,21 +200,59 @@ class PostgresQueryHistory:
             ).all()
         return pick_best([PastQuery(q, s, float(sim)) for q, s, sim in rows], k, min_similarity)
 
-    def backfill(self) -> int:
-        """Add successful chat turns that have no example for the current embedding model."""
+    def examples(self) -> list[Example]:
         with self._engine.connect() as conn:
-            turns = conn.execute(
+            rows = conn.execute(
                 text(
-                    "SELECT t.id, t.standalone, t.sql, t.row_count FROM chat_memory.chat_turns t "
-                    "WHERE t.sql IS NOT NULL AND t.error IS NULL AND t.row_count > 0 "
-                    "AND NOT EXISTS (SELECT 1 FROM chat_memory.query_examples e "
-                    "WHERE e.question = t.standalone AND e.sql = t.sql "
-                    "AND (e.embed_model = :embed_model OR NOT e.enabled)) "
-                    "ORDER BY t.id"
+                    "SELECT min(id), question, sql, min(created_at) "
+                    "FROM chat_memory.query_examples GROUP BY question, sql "
+                    "HAVING bool_and(enabled) ORDER BY min(id) DESC"
+                )
+            ).all()
+        return [Example(*row) for row in rows]
+
+    def status(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], ExampleStatus]:
+        if not pairs:
+            return {}
+        questions, sqls = (list(column) for column in zip(*pairs, strict=True))
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT e.question, e.sql, bool_and(e.enabled) "
+                    "FROM chat_memory.query_examples e "
+                    "JOIN unnest(CAST(:questions AS text[]), CAST(:sqls AS text[])) "
+                    "AS p(question, sql) ON e.question = p.question AND e.sql = p.sql "
+                    "GROUP BY e.question, e.sql"
+                ),
+                {"questions": questions, "sqls": sqls},
+            ).all()
+        return {(q, sql): "saved" if enabled else "hidden" for q, sql, enabled in rows}
+
+    def hide(self, question: str, sql: str) -> int:
+        with self._engine.begin() as conn:
+            return conn.execute(
+                text(
+                    "UPDATE chat_memory.query_examples SET enabled = false "
+                    "WHERE enabled AND question = :question AND sql = :sql"
+                ),
+                {"question": question, "sql": sql},
+            ).rowcount
+
+    def backfill(self) -> int:
+        """Embed the stored examples again for the current embedding model, where missing."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT DISTINCT ON (question, sql) turn_id, question, sql, row_count "
+                    "FROM chat_memory.query_examples e WHERE NOT EXISTS ("
+                    "SELECT 1 FROM chat_memory.query_examples x "
+                    "WHERE x.question = e.question AND x.sql = e.sql "
+                    "AND (x.embed_model = :embed_model OR NOT x.enabled)) "
+                    "ORDER BY question, sql, id"
                 ),
                 {"embed_model": self._embed_model},
             ).all()
-        return sum(self.add(question, sql, rows, turn_id) for turn_id, question, sql, rows in turns)
+        return sum(self.add(question, sql, n, turn_id) for turn_id, question, sql, n in rows)
 
 
 def get_query_history(settings: Settings | None = None) -> PostgresQueryHistory:

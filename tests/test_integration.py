@@ -111,13 +111,15 @@ def test_chat_store_round_trip(test_thread: str) -> None:
         answer_reasoning="Read the rows.",
         model="qwen3.5:9b",
     )
-    store.append(test_thread, first)
-    store.append(test_thread, make_turn("second", sql=None, answer="failed"))
+    second = make_turn("second", sql=None, answer="failed")
+    ids = [store.append(test_thread, first), store.append(test_thread, second)]
 
-    assert store.load(test_thread) == [first, make_turn("second", sql=None, answer="failed")]
+    # Loaded turns carry their id; an id in an appended turn is ignored.
+    assert store.load(test_thread) == [{**first, "id": ids[0]}, {**second, "id": ids[1]}]
     assert [t["question"] for t in store.load(test_thread, 1)] == ["second"]
     [summary] = [t for t in store.threads(limit=1000) if t.thread_id == test_thread]
     assert (summary.turns, summary.first_question) == (2, "first")
+    assert store.append(test_thread, store.load(test_thread)[0]) > ids[1]
 
 
 def _turn_metrics(load_ms: int = 0) -> TurnMetrics:
@@ -247,18 +249,44 @@ def test_disabled_example_is_hidden_and_not_re_added(pg_history: PostgresQueryHi
     assert pg_history.search("Average salary per department?", 5, 0.0)[0].sql == "SELECT 1"
 
 
-def test_backfill_adds_successful_turns_only(
-    pg_history: PostgresQueryHistory, test_thread: str
-) -> None:
-    store = get_chat_store()
-    store.append(test_thread, make_turn("Remote employees per city?", sql="SELECT 7"))
-    store.append(test_thread, make_turn("Broken question about salary?", sql=None))
+def test_examples_status_and_hide(pg_history: PostgresQueryHistory) -> None:
+    saved = (f"Average salary per department? {pg_history._embed_model}", "SELECT 1")
+    hidden = (f"Highest salary per city? {pg_history._embed_model}", "SELECT 2")
+    pg_history.add(*saved, 4)
+    pg_history.add(*hidden, 9)
+    assert pg_history.hide(*hidden) == 1
+    assert pg_history.hide(*hidden) == 0  # already hidden
 
-    assert pg_history.backfill() >= 1
-    assert pg_history.backfill() == 0  # nothing left for this model
-    sqls = [q.sql for q in pg_history.search("Remote employees per city?", 5, 0.99)]
-    assert "SELECT 7" in sqls
-    assert not pg_history.search("Broken question about salary?", 5, 0.99)
+    unknown = (saved[0], "SELECT 99")
+    assert pg_history.status([saved, hidden, unknown]) == {saved: "saved", hidden: "hidden"}
+    assert pg_history.status([]) == {}
+    listed = [(e.question, e.sql) for e in pg_history.examples()]
+    assert saved in listed
+    assert hidden not in listed
+    assert not pg_history.add(*hidden, 9)  # a hidden pair is never saved again
+
+
+def test_backfill_embeds_stored_examples_for_the_current_model(
+    pg_history: PostgresQueryHistory,
+) -> None:
+    old_model = f"{pg_history._embed_model}-old"
+    old = PostgresQueryHistory(get_engine("memory"), KeywordEmbeddings(), embed_model=old_model)
+    try:
+        old.add("Remote employees per city?", f"SELECT 7 -- {old_model}", 3)
+        old.add("Broken question about salary?", f"SELECT 8 -- {old_model}", 1)
+        old.hide("Broken question about salary?", f"SELECT 8 -- {old_model}")
+
+        assert pg_history.backfill() >= 1
+        assert pg_history.backfill() == 0  # nothing left for this model
+        sqls = [q.sql for q in pg_history.search("Remote employees per city?", 5, 0.99)]
+        assert f"SELECT 7 -- {old_model}" in sqls
+        assert not pg_history.search("Broken question about salary?", 5, 0.99)
+    finally:
+        with get_engine("admin").begin() as conn:
+            conn.execute(
+                text("DELETE FROM chat_memory.query_examples WHERE embed_model = :m"),
+                {"m": old_model},
+            )
 
 
 def test_reader_role_cannot_read_query_history() -> None:
@@ -268,9 +296,17 @@ def test_reader_role_cannot_read_query_history() -> None:
         )
 
 
-def test_chat_role_cannot_enable_or_disable_examples() -> None:
-    with pytest.raises(DBAPIError, match="permission denied"):
-        set_enabled(get_engine("memory"), [1], enabled=False)
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "UPDATE chat_memory.query_examples SET sql = 'SELECT 1' WHERE false",
+        "DELETE FROM chat_memory.query_examples WHERE false",
+    ],
+)
+def test_chat_role_can_only_hide_examples(statement: str) -> None:
+    # It may set `enabled` (hiding from the web UI), but not change or delete examples.
+    with pytest.raises(DBAPIError, match="permission denied"), get_engine("memory").begin() as conn:
+        conn.execute(text(statement))
 
 
 # --- evaluation ------------------------------------------------------------------------------

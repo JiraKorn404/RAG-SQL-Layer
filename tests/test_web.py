@@ -4,11 +4,13 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from streamlit.testing.v1 import AppTest
 
 from rag_sql.agent.graph import build_graph
+from rag_sql.history.queries import InMemoryQueryHistory
 from rag_sql.llm import ChatModelInfo
 from rag_sql.ui.steps import Step
 from rag_sql.ui.web import model_label
 from rag_sql.ui.web_chat import INTERRUPTED, run_turn
-from tests.conftest import fake_llm
+from rag_sql.ui.web_examples import filter_examples
+from tests.conftest import KeywordEmbeddings, fake_llm, make_turn
 
 SQL_REPLY = AIMessage(
     content="```sql\nSELECT emp_name, salary FROM employees\n```",
@@ -123,6 +125,18 @@ def test_finished_run_is_not_saved_again() -> None:
     assert saved == []
 
 
+def test_run_turn_returns_the_saved_turn_with_its_id() -> None:
+    turn = make_turn("Q?")
+    items = [("updates", {"save_turn": {"history": [turn], "turn_id": 5}})]
+    assert run_turn(ScriptedGraph(items), "Q?", "t1", [], 2) == {**turn, "id": 5}
+
+
+def test_run_turn_returns_a_failed_turn_with_its_error() -> None:
+    items = [("updates", {"generate_sql": {"sql": "SELECT 1", "attempts": 1, "reasoning": None}})]
+    turn = run_turn(ScriptedGraph(items, RuntimeError("Ollama is down")), "Q?", "t1", [], 2)
+    assert (turn["error"], "id" in turn) == ("Ollama is down", False)
+
+
 def test_failed_save_of_unfinished_run_is_only_logged(caplog) -> None:
     def broken(_turn) -> None:
         raise RuntimeError("db down")
@@ -150,13 +164,16 @@ class NamedFakeChatModel(GenericFakeChatModel):
     model: str
 
 
-def _app(settings, chat_store, graph_for, list_models=lambda: MODELS) -> AppTest:
+def _app(
+    settings, chat_store, graph_for, list_models=lambda: MODELS, query_history=None
+) -> AppTest:
     at = AppTest.from_string(APP, default_timeout=30)
     at.session_state["deps"] = {
         "graph_for": graph_for,
         "store": chat_store,
         "settings": settings.model_copy(update={"ollama_chat_model": "gemma4:e4b"}),
         "list_models": list_models,
+        "query_history": query_history or InMemoryQueryHistory(KeywordEmbeddings()),
     }
     return at
 
@@ -248,3 +265,127 @@ def test_app_falls_back_when_models_cannot_be_listed(
     at.chat_input[0].set_value("Who earns the most?").run()
     assert not at.exception
     assert chosen == [ChatModelInfo("gemma4:e4b", None, thinking=True)]
+
+
+# --- thumbs up and the Query examples page ------------------------------------------------------
+
+
+def _thumbs(at: AppTest) -> list:
+    return [b for b in at.button if b.label == "Good answer"]
+
+
+def test_thumbs_up_saves_the_example(
+    settings, retriever, ok_runner, stores, chat_store, query_history
+) -> None:
+    graph = _fake_graph(settings, retriever, ok_runner, stores, SQL_REPLY, ANSWER_REPLY)
+    at = _app(settings, chat_store, lambda _model: graph, query_history=query_history)
+    at.run()
+    at.chat_input[0].set_value("Who earns the most?").run()
+    assert not at.exception
+    assert query_history.examples() == []  # nothing is saved without a thumbs up
+
+    [thumb] = _thumbs(at)
+    thumb.click().run()
+    assert not at.exception
+    [example] = query_history.examples()
+    [turn] = chat_store.load(at.session_state["thread_id"])
+    assert (example.question, example.sql) == ("Who earns the most?", turn["sql"])
+    assert not _thumbs(at)
+    assert any("Saved as an example" in c for c in _captions(at))
+
+    # Reopened from the sidebar, the reply still shows it is saved.
+    at.sidebar.button[0].click().run()
+    at.sidebar.button[1].click().run()
+    assert not at.exception
+    assert not _thumbs(at)
+    assert any("Saved as an example" in c for c in _captions(at))
+
+
+def test_hidden_example_cannot_be_saved_again(
+    settings, retriever, ok_runner, stores, chat_store, query_history
+) -> None:
+    graph = _fake_graph(settings, retriever, ok_runner, stores, SQL_REPLY, ANSWER_REPLY)
+    at = _app(settings, chat_store, lambda _model: graph, query_history=query_history)
+    at.run()
+    at.chat_input[0].set_value("Who earns the most?").run()
+    [turn] = chat_store.load(at.session_state["thread_id"])
+    query_history.add(turn["standalone"], turn["sql"], 1)
+    query_history.hide(turn["standalone"], turn["sql"])
+
+    at.run()
+    assert not at.exception
+    assert not _thumbs(at)
+    assert any("Hidden from the query examples" in c for c in _captions(at))
+
+
+def test_no_thumbs_up_when_the_sql_failed(
+    settings, retriever, ok_runner, stores, chat_store
+) -> None:
+    # Rejected by validation every time, so no query runs.
+    graph = _fake_graph(settings, retriever, ok_runner, stores, *["DROP TABLE employees"] * 3)
+    at = _app(settings, chat_store, lambda _model: graph)
+    at.run()
+    at.chat_input[0].set_value("Who earns the most?").run()
+    assert not at.exception
+    assert at.error  # the rejected SQL is shown
+    assert not _thumbs(at)
+
+
+EXAMPLES_APP = """
+import streamlit as st
+from rag_sql.ui.web_examples import examples_page
+
+examples_page(st.session_state["query_history"])
+"""
+
+
+def _examples_app(query_history) -> AppTest:
+    at = AppTest.from_string(EXAMPLES_APP, default_timeout=30)
+    at.session_state["query_history"] = query_history
+    return at
+
+
+def test_filter_examples_matches_every_word_in_question_or_sql(query_history) -> None:
+    query_history.add("Average salary per city?", "SELECT city, avg(salary) FROM employees", 4)
+    query_history.add("How many remote employees?", "SELECT count(*) FROM employees", 1)
+    examples = query_history.examples()
+    assert [e.id for e in filter_examples(examples, "  ")] == [2, 1]
+    assert [e.id for e in filter_examples(examples, "CITY avg")] == [1]
+    assert [e.id for e in filter_examples(examples, "count remote")] == [2]
+    assert filter_examples(examples, "city remote") == []
+
+
+def test_examples_page_lists_filters_and_hides(query_history) -> None:
+    query_history.add("Average salary per city?", "SELECT city, avg(salary) FROM employees", 4)
+    query_history.add("How many remote employees?", "SELECT count(*) FROM employees", 1)
+    at = _examples_app(query_history)
+    at.run()
+    assert not at.exception
+    assert [c.value for c in at.code] == [
+        "SELECT count(*) FROM employees",
+        "SELECT city, avg(salary) FROM employees",
+    ]
+
+    at.text_input[0].set_value("city").run()
+    assert [c.value for c in at.code] == ["SELECT city, avg(salary) FROM employees"]
+    assert "1 of 2 example(s)" in _captions(at)
+    at.text_input[0].set_value("").run()
+
+    # Hide asks to confirm; Cancel keeps the example.
+    at.button(key="hide-1").click().run()
+    assert at.button(key="confirm-hide-1")
+    at.button(key="cancel-hide-1").click().run()
+    assert len(query_history.examples()) == 2
+
+    at.button(key="hide-1").click().run()
+    at.button(key="confirm-hide-1").click().run()
+    assert not at.exception
+    assert [e.id for e in query_history.examples()] == [2]
+    assert [c.value for c in at.code] == ["SELECT count(*) FROM employees"]
+
+
+def test_examples_page_without_examples(query_history) -> None:
+    at = _examples_app(query_history)
+    at.run()
+    assert not at.exception
+    assert at.info[0].value.startswith("No examples yet.")

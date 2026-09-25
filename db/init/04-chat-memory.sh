@@ -1,12 +1,14 @@
 #!/bin/bash
 # Creates the chat history tables and the role that reads and writes them (CHAT_DB_USER):
 #   chat_turns      every question and answer, per conversation (thread_id)
-#   query_examples  successful question + SQL pairs with embeddings, retrieved as SQL examples
+#   query_examples  question + SQL pairs a user marked as good (thumbs up in the web UI), with
+#                   embeddings, retrieved as SQL examples
 #   turn_metrics    time and tokens of each node of a turn
 # - All live in their own schema, chat_memory. The agent's read-only role gets no access to it,
 #   so generated SQL can never read past conversations, and it is not indexed by rag-sql-index.
 # - The chat role can only SELECT and INSERT there: history is append-only and kept forever.
-#   Examples are disabled/enabled by the admin (`rag-sql-history disable|enable`).
+#   The one exception: it can set query_examples.enabled, so the web UI can hide an example.
+#   Rows are never deleted; the admin can also disable/enable (`rag-sql-history disable|enable`).
 # - Requires the pgvector extension (01-extensions.sql).
 # Runs automatically on first start with an empty data volume. It is idempotent, so on an
 # existing database re-run it with:
@@ -74,10 +76,10 @@ CREATE TABLE IF NOT EXISTS chat_memory.query_examples (
 CREATE UNIQUE INDEX IF NOT EXISTS query_examples_unique_idx
     ON chat_memory.query_examples (embed_model, md5(question), md5(sql));
 
-COMMENT ON TABLE chat_memory.query_examples IS 'Successful question + SQL pairs, retrieved by vector similarity as SQL examples.';
+COMMENT ON TABLE chat_memory.query_examples IS 'Question + SQL pairs a user marked as good, retrieved by vector similarity as SQL examples.';
 COMMENT ON COLUMN chat_memory.query_examples.question IS 'Standalone question (follow-ups rewritten using the conversation).';
 COMMENT ON COLUMN chat_memory.query_examples.embedding IS 'Embedding of question, made with embed_model.';
-COMMENT ON COLUMN chat_memory.query_examples.enabled IS 'false = excluded from retrieval and never re-added.';
+COMMENT ON COLUMN chat_memory.query_examples.enabled IS 'false = hidden (web UI or admin): excluded from retrieval and never re-added.';
 
 -- Time and tokens of each node of a turn (src/rag_sql/metrics.py), one row per node run in
 -- run order; a turn's totals are sums over its rows. Rows go when their turn is deleted (admin).
@@ -105,5 +107,7 @@ GRANT CONNECT ON DATABASE :"db_name" TO :"chat_user";
 GRANT USAGE ON SCHEMA chat_memory TO :"chat_user";
 GRANT SELECT, INSERT ON chat_memory.chat_turns TO :"chat_user";
 GRANT SELECT, INSERT ON chat_memory.query_examples TO :"chat_user";
+-- Hiding an example from the web UI; no other column can change, and nothing can be deleted.
+GRANT UPDATE (enabled) ON chat_memory.query_examples TO :"chat_user";
 GRANT SELECT, INSERT ON chat_memory.turn_metrics TO :"chat_user";
 SQL

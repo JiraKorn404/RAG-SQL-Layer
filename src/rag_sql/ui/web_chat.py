@@ -150,18 +150,21 @@ def run_turn(
     *,
     config: RunnableConfig | None = None,
     save_unfinished: Callable[[Turn], None] | None = None,
-) -> None:
+) -> Turn:
     """Run the agent on `question`, rendering as it goes and appending to `steps`.
 
     `steps` is filled in place, so a run cut short by a new question keeps what it showed. A run
     that doesn't reach save_turn, because it failed or a new question stopped it, is passed to
     `save_unfinished` with its error, so the saved conversation matches what was shown.
     `config` is passed to the graph run (tracing, see tracing.py).
+
+    Returns the run's turn: as save_turn saved it (with its `id` when it was stored), or, for a
+    failed run, with its error.
     """
     attempts = 0
     live: LiveCall | None = None
     state: dict[str, Any] = {"question": question, "thread_id": thread_id}
-    saved = False
+    turn: Turn | None = None
     # Streamlit stops a run for a new question by raising a BaseException in it (RerunException),
     # which `except Exception` doesn't catch, so the error stays INTERRUPTED then.
     error = INTERRUPTED
@@ -184,7 +187,11 @@ def run_turn(
                 # Updates are per node: add up the metrics like the graph's reducer does.
                 state.update({k: v for k, v in update.items() if k != "metrics"})
                 state["metrics"] = [*state.get("metrics", []), *update.get("metrics", [])]
-                saved = saved or node == "save_turn"
+                if node == "save_turn":
+                    # save_turn appends the turn to the history; rebuild it if it didn't.
+                    turn = (update.get("history") or [turn_from_state(state)])[-1]
+                    if update.get("turn_id") is not None:
+                        turn = Turn(**{**turn, "id": update["turn_id"]})
                 attempts = update.get("attempts", attempts)
                 new = steps_from_update(
                     node, update, question=question, attempts=attempts, max_retries=max_retries
@@ -206,14 +213,16 @@ def run_turn(
         render_step(failed)
         steps.append(failed)
     finally:
-        if not saved:
+        if turn is None:
             if error == INTERRUPTED:
                 # No Streamlit calls while the run is being stopped: the next run draws these.
                 if live is not None:
                     steps.extend(live.streamed_steps())
                 steps.append(Step("error", INTERRUPTED, label="Interrupted"))
+            turn = unfinished_turn(state, error, live)
             if save_unfinished is not None:
                 try:
-                    save_unfinished(unfinished_turn(state, error, live))
+                    save_unfinished(turn)
                 except Exception:
                     logger.exception("Could not save the unfinished turn (thread %s)", thread_id)
+    return turn

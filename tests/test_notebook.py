@@ -38,11 +38,10 @@ def test_run_and_display_renders_each_step(
     assert any(t.startswith("### SQL\n```sql\nSELECT") for t in texts)
     assert any(t.startswith("### SQL output\n1 row(s)") for t in texts)
     assert any("Employee_1" in t for t in texts)  # the result table
-    assert texts[-3] == r"### Answer" + "\n" + r"Costs \$5 and \$6."
+    assert texts[-2] == r"### Answer" + "\n" + r"Costs \$5 and \$6."
     # Timing: summary line, with the per-node table inside.
-    assert re.search(r"<summary>\d+\.\d s · 1 attempt</summary>", texts[-2])
-    assert "<td>generate_sql</td>" in texts[-2]
-    assert "Saved to query history" in texts[-1]
+    assert re.search(r"<summary>\d+\.\d s · 1 attempt</summary>", texts[-1])
+    assert "<td>generate_sql</td>" in texts[-1]
     assert [t["question"] for t in chat_store.load("t1")] == ["Who earns the most?"]
 
 

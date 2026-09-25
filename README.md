@@ -110,15 +110,15 @@ uv run streamlit run src/rag_sql/ui/web.py
 
 ### Query history
 
-Every query that runs and returns rows is saved with an embedding of its question. For each new question, the agent retrieves up to `QUERY_HISTORY_K` (default 5) similar past queries from pgvector and shows them to the model as extra examples. They appear in the notebook as "Similar past queries". Only matches with a similarity of at least `QUERY_HISTORY_MIN_SIMILARITY` (default 0.75) are used, so a new kind of question can get none.
+In the web UI, a reply whose query ran and returned rows ends with a **Good answer** (thumbs up) button. Clicking it saves the question and its SQL, with an embedding of the question, as a query example. Nothing is saved without that click. For each new question, the agent retrieves up to `QUERY_HISTORY_K` (default 5) similar examples from pgvector and shows them to the model as extra examples. They appear as "Similar past queries". Only matches with a similarity of at least `QUERY_HISTORY_MIN_SIMILARITY` (default 0.75) are used, so a new kind of question can get none.
+
+The web UI's **Query examples** page (in the sidebar) lists every example's question and SQL, with a search box. **Hide** stops the agent from using an example; it stays in the database, and a thumbs up can't save it again.
 
 ```sh
-uv run rag-sql-history backfill          # add successful questions already in chat history
 uv run rag-sql-history list --sql        # see what is stored, with ids
-uv run rag-sql-history disable 12 15     # a query ran but was wrong: stop using it (enable to undo)
+uv run rag-sql-history disable 12 15     # same as Hide in the web UI (admin; enable to bring one back)
+uv run rag-sql-history backfill          # after changing OLLAMA_EMBED_MODEL: embed the examples again
 ```
-
-Run `backfill` again after changing `OLLAMA_EMBED_MODEL`.
 
 ### Metrics
 

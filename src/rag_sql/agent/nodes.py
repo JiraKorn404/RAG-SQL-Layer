@@ -260,22 +260,3 @@ def save_turn(state: AgentState, *, store: ChatStore, model: str | None = None) 
         "turn_id": turn_id,
         "turn_metrics": turn["metrics"],
     }
-
-
-def save_query_example(state: AgentState, *, query_history: QueryHistory) -> dict:
-    """Add the turn's SQL to the query history when it ran and returned rows.
-
-    Only for runs with a thread_id, like chat history. A failed save is logged, not raised.
-    """
-    result = state.get("result")
-    sql = state.get("sql")
-    if not state.get("thread_id") or result is None or result.row_count == 0 or not sql:
-        return {"example_saved": False}
-    try:
-        saved = query_history.add(
-            current_question(state), sql, result.row_count, turn_id=state.get("turn_id")
-        )
-    except Exception:
-        logger.exception("Could not save the query to query history")
-        saved = False
-    return {"example_saved": saved}

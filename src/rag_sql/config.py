@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     vector_collection: str = "schema_docs"
     retrieval_k: int = Field(6, gt=0)
     # Schemas whose tables are indexed and shown to the model (comma-separated in .env)
-    db_schemas: Annotated[tuple[str, ...], NoDecode] = ("public", "imba")
+    db_schemas: Annotated[tuple[str, ...], NoDecode] = ("public", "imba", "retail")
 
     # Chat history: earlier turns shown to the model (0 = none; turns are still saved)
     chat_history_turns: int = Field(5, ge=0)

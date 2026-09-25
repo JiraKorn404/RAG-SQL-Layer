@@ -1,4 +1,3 @@
-import pytest
 from langchain_core.messages import AIMessage
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -201,7 +200,7 @@ def test_save_turn_appends_and_saves(chat_store) -> None:
         "metrics": None,  # no node metrics in the state
     }
     assert update["history"] == [make_turn("q0"), turn]
-    assert chat_store.load("t1") == [turn]
+    assert chat_store.load("t1") == [{**turn, "id": update["turn_id"]}]
     assert update["turn_metrics"] is None
 
 
@@ -283,28 +282,6 @@ def _finished_state(**overrides) -> dict:
         "answer": "Paris: 1.",
     }
     return state | overrides
-
-
-def test_save_query_example_stores_standalone_question(query_history) -> None:
-    assert nodes.save_query_example(_finished_state(), query_history=query_history) == {
-        "example_saved": True
-    }
-    [found] = query_history.search("Average salary per city?", 5, 0.9)
-    assert found.sql == "SELECT city, avg(salary) FROM employees GROUP BY 1"
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"thread_id": None},  # not a saved conversation
-        {"result": None, "error": "boom"},  # every attempt failed
-        {"result": QueryResult(columns=["city"])},  # no rows
-    ],
-)
-def test_save_query_example_skips_unsuccessful_turns(query_history, overrides) -> None:
-    state = _finished_state(**overrides)
-    assert nodes.save_query_example(state, query_history=query_history) == {"example_saved": False}
-    assert query_history.search("Average salary per city?", 5, 0.0) == []
 
 
 def test_save_turn_returns_turn_id(chat_store) -> None:

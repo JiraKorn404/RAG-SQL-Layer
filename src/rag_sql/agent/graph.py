@@ -87,7 +87,8 @@ def build_graph(
 ) -> CompiledStateGraph:
     """Compile the agent graph. Pass fakes for any dependency to run without network or DB.
 
-    Chat history and query history are saved only for runs whose input has a `thread_id`.
+    Chat history is saved only for runs whose input has a `thread_id`. The query history is only
+    searched here: examples are added when a user marks a turn as good (web UI).
     """
     s = settings or get_settings()
 
@@ -117,7 +118,6 @@ def build_graph(
         "execute_sql": partial(nodes.execute_sql, run_query=query_runner),
         "answer": partial(nodes.answer, llm=llm),
         "save_turn": partial(nodes.save_turn, store=chat_store, model=chat_model_name(llm)),
-        "save_query_example": partial(nodes.save_query_example, query_history=query_history),
     }
     graph = StateGraph(AgentState)
     for name, step in steps.items():
@@ -140,6 +140,5 @@ def build_graph(
         ["answer", "generate_sql"],
     )
     graph.add_edge("answer", "save_turn")
-    graph.add_edge("save_turn", "save_query_example")
-    graph.add_edge("save_query_example", END)
+    graph.add_edge("save_turn", END)
     return graph.compile()

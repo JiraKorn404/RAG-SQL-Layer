@@ -51,3 +51,30 @@ def test_disabled_examples_are_hidden_and_never_re_added(history) -> None:
 
     history.set_enabled([1], enabled=True)
     assert history.search("average salary department", 1, 0.0)[0].sql == "SELECT 1"
+
+
+def test_examples_newest_first_without_hidden(history) -> None:
+    assert [e.sql for e in history.examples()] == ["SELECT 3", "SELECT 2", "SELECT 1"]
+    history.hide("Highest salary per city?", "SELECT 2")
+    assert [(e.id, e.question) for e in history.examples()] == [
+        (3, "How many remote employees?"),
+        (1, "Average salary per department?"),
+    ]
+
+
+def test_status_of_saved_hidden_and_unknown_pairs(history) -> None:
+    history.hide("Highest salary per city?", "SELECT 2")
+    pairs = [
+        ("Average salary per department?", "SELECT 1"),
+        ("Highest salary per city?", "SELECT 2"),
+        ("Average salary per department?", "SELECT 99"),  # same question, other SQL: not stored
+    ]
+    assert history.status(pairs) == {pairs[0]: "saved", pairs[1]: "hidden"}
+    assert history.status([]) == {}
+
+
+def test_hidden_pair_is_not_retrieved_nor_saved_again(history) -> None:
+    assert history.hide("Average salary per department?", "SELECT 1") == 1
+    assert history.hide("Average salary per department?", "SELECT 1") == 0  # already hidden
+    assert "SELECT 1" not in [q.sql for q in history.search("average salary department", 5, 0.0)]
+    assert history.add("Average salary per department?", "SELECT 1", 4) is False

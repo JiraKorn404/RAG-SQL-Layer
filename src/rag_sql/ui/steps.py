@@ -138,9 +138,24 @@ def steps_from_update(
         return [*steps, Step("answer", update.get("answer", ""))]
     if node == "save_turn" and (metrics := update.get("turn_metrics")):
         return [metrics_step(metrics)]
-    if node == "save_query_example" and update.get("example_saved"):
-        return [Step("caption", "Saved to query history as an example for similar questions.")]
     return []
+
+
+@dataclass(frozen=True)
+class ExampleCandidate:
+    """A turn a user can mark as good, which stores its question + SQL as a query example."""
+
+    question: str  # the standalone question: what the SQL answers
+    sql: str
+    row_count: int
+    turn_id: int | None
+
+
+def example_candidate(turn: Turn) -> ExampleCandidate | None:
+    """The example a turn can be saved as: only when its SQL ran without error and found rows."""
+    if not turn["sql"] or turn["error"] or not turn["row_count"]:
+        return None
+    return ExampleCandidate(turn["standalone"], turn["sql"], turn["row_count"], turn.get("id"))
 
 
 def steps_from_turn(turn: Turn) -> list[Step]:

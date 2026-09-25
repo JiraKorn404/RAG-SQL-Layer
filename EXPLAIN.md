@@ -69,8 +69,8 @@ The agent:
 4. asks the LLM to answer the question from those rows.
 
 Every step is streamed to the user: the model's thinking, the SQL, the result table and the
-answer. It also remembers conversations (so "and the lowest?" works) and past successful queries
-(to use them as examples for similar questions later).
+answer. It also remembers conversations (so "and the lowest?" works) and the queries users marked
+as good with a thumbs up in the web UI (to use them as examples for similar questions later).
 
 ### 1.2 The systems involved
 
@@ -83,7 +83,7 @@ flowchart LR
     end
 
     subgraph PG["PostgreSQL 17 + pgvector (Docker service 'postgres')"]
-        DATA[("public.employees<br/>imba.* (Instacart)")]
+        DATA[("public.employees<br/>imba.* (Instacart)<br/>retail.* (retail warehouse)")]
         VEC[("langchain_pg_collection<br/>langchain_pg_embedding<br/>(schema + few-shot index)")]
         MEM[("chat_memory.chat_turns<br/>chat_memory.query_examples<br/>chat_memory.turn_metrics")]
     end
@@ -94,7 +94,7 @@ flowchart LR
 
     NB & WEB & CLI -->|"reader role: SELECT only"| DATA
     NB & WEB & CLI -->|"reader role"| VEC
-    NB & WEB & CLI -->|"memory role: SELECT + INSERT"| MEM
+    NB & WEB & CLI -->|"memory role: SELECT + INSERT (+ hide examples)"| MEM
     CLI -->|"admin role: indexing, enable/disable"| VEC
     NB & WEB & CLI -->|"HTTP"| OLLAMA
 ```
@@ -104,8 +104,8 @@ security model (see [5.1](#51-security-in-layers)):
 
 | Role | Setting keys | Can do | Used by |
 |---|---|---|---|
-| `reader` | `APP_DB_USER` / `APP_DB_PASSWORD` | `SELECT` on `public` and `imba`, every transaction read-only | the agent's SQL, the retriever |
-| `memory` | `CHAT_DB_USER` / `CHAT_DB_PASSWORD` | `SELECT` + `INSERT` on the three `chat_memory` tables only | chat history, query history, metrics |
+| `reader` | `APP_DB_USER` / `APP_DB_PASSWORD` | `SELECT` on `public`, `imba` and `retail`, every transaction read-only | the agent's SQL, the retriever |
+| `memory` | `CHAT_DB_USER` / `CHAT_DB_PASSWORD` | `SELECT` + `INSERT` on the three `chat_memory` tables, `UPDATE` of `query_examples.enabled` only | chat history, query history, metrics |
 | `admin` | `POSTGRES_USER` / `POSTGRES_PASSWORD` | everything | `rag-sql-index`, `rag-sql-history disable/enable` |
 
 ### 1.3 Module map (who imports whom)
@@ -115,6 +115,7 @@ flowchart TB
     subgraph L5["Front ends and tools"]
         notebook["ui/notebook.py"]
         web["ui/web.py"] --> web_chat["ui/web_chat.py"]
+        web --> web_examples["ui/web_examples.py"]
         cli["cli.py"]
         runner["evaluation/runner.py"]
     end
@@ -209,10 +210,14 @@ Input: `{"question": "Which department has the highest average salary?", "thread
 | 7 | `execute_sql` | Ran it as the read-only role | `result: QueryResult(columns=['department','avg_salary'], rows=[('Engineering', 98765.43)], truncated=False)`, `error: None`, `db_unavailable: False` |
 | 8 | `answer` | Model call #2 with the rows as a Markdown table | `answer: "Engineering has the highest average salary, about 98,765.43."`, `answer_reasoning: None` |
 | 9 | `save_turn` | Built a `Turn` and inserted it (plus 8 metric rows) into `chat_memory` | `history: [turn]`, `turn_id: 1`, `turn_metrics: {...}` |
-| 10 | `save_query_example` | The SQL ran and returned ≥ 1 row, so (standalone question, SQL) is embedded and stored | `example_saved: True` |
 
 Every update above also carries `metrics: [NodeMetric]`. The `timed()` wrapper adds it (see
 [3.5](#35-the-timed-wrapper-and-metrics)).
+
+The graph ends there: it never stores query examples itself. In the web UI the reply ends with a
+**Good answer** (thumbs up) button, because its SQL ran and returned ≥ 1 row. Say the user clicks
+it: (standalone question, SQL) is embedded and stored in `chat_memory.query_examples`, linked to
+turn 1 (see [4.8](#48-historyqueriespy)).
 
 Note what `validate_sql` did to the SQL. The model wrote `round(avg(salary), 2)`, and the
 validated version is `ROUND(CAST(AVG(salary) AS DECIMAL), 2)`. The query that runs is **printed
@@ -232,9 +237,9 @@ The graph has **no checkpointer**, so every run starts from empty state (`attemp
 | 1 | `load_history` | `history: [turn 1]` loaded from `chat_memory.chat_turns` |
 | 2 | `condense_question` | **Model call.** Rewrites the follow-up: `standalone_question: "Which department has the lowest average salary?"` |
 | 3 | `retrieve_context` | Searches with the *standalone* question, not "And the lowest?" |
-| 4 | `find_similar_queries` | Finds turn 1's pair (similarity 0.75 with the test embeddings) → `similar_queries: [PastQuery(...)]`. Query history isn't per thread: any thread's successful queries can show up. |
+| 4 | `find_similar_queries` | Finds turn 1's pair, saved by the thumbs up (similarity 0.75 with the test embeddings) → `similar_queries: [PastQuery(...)]`. Query history isn't per thread: any thread's saved examples can show up. |
 | 5 | `generate_sql` | The prompt now also has the "Similar questions" and "Earlier questions … and their SQL" sections |
-| 6–10 | … | Same as turn 1 |
+| 6–9 | … | Same as turn 1 |
 
 ### 2.3 The prompts the model actually saw on turn 2
 
@@ -364,14 +369,13 @@ flowchart TD
     EX -->|"SQL error and retries used up"| AN
 
     AN --> ST[save_turn]
-    ST --> SQ[save_query_example]
-    SQ --> E([END])
+    ST --> E([END])
 
     classDef llm fill:#fde68a,stroke:#b45309,color:#111
     classDef db fill:#bfdbfe,stroke:#1d4ed8,color:#111
     classDef pure fill:#e5e7eb,stroke:#4b5563,color:#111
     class CQ,GS,AN llm
-    class LH,RC,FS,EX,ST,SQ db
+    class LH,RC,FS,EX,ST db
     class VS pure
 ```
 
@@ -401,9 +405,6 @@ load_history ──► condense_question ──► retrieve_context ──► fi
                                                                             │
                                                                             ▼
                                                                         save_turn
-                                                                            │
-                                                                            ▼
-                                                                  save_query_example
                                                                             │
                                                                             ▼
                                                                            END
@@ -493,23 +494,22 @@ keys the new value replaces the old one. The exception is `metrics`, whose reduc
 
 | Field | Written by | Read by |
 |---|---|---|
-| `thread_id` | caller (input) | `load_history`, `save_turn`, `save_query_example` |
+| `thread_id` | caller (input) | `load_history`, `save_turn` |
 | `question` | caller (input) | almost every node |
 | `history` | caller (input, stateless mode), `load_history`, `save_turn` (appends this turn) | `condense_question`, `generate_sql`, `answer` |
 | `standalone_question` | `condense_question` | everything after, through `current_question()` |
 | `context` | `retrieve_context` | `find_similar_queries` (to drop duplicates), `generate_sql`, `answer` (`chat_reply`: table names) |
 | `similar_queries` | `find_similar_queries` | `generate_sql` |
 | `reasoning` | `generate_sql` | `save_turn` (as `sql_reasoning`) |
-| `sql` | `generate_sql` (raw), `validate_sql` (normalized, only when valid) | `generate_sql` (retry feedback), `execute_sql`, `answer`, `save_turn`, `save_query_example` |
+| `sql` | `generate_sql` (raw), `validate_sql` (normalized, only when valid) | `generate_sql` (retry feedback), `execute_sql`, `answer`, `save_turn` |
 | `no_sql` | `generate_sql` | `route_after_generate`, `answer` |
 | `error` | `generate_sql` (clears), `validate_sql`, `execute_sql` | routers, `generate_sql` (feedback), `answer`, `save_turn` |
 | `db_unavailable` | `execute_sql` | `route_after_execute`, `answer` |
 | `attempts` | `generate_sql` | routers, `answer` (failure message), `timed()` (metric's `attempt`) |
-| `result` | `generate_sql` (clears), `execute_sql` | `answer`, `save_turn`, `save_query_example` |
+| `result` | `generate_sql` (clears), `execute_sql` | `answer`, `save_turn` |
 | `answer`, `answer_reasoning` | `answer` | `save_turn` |
-| `turn_id` | `save_turn` | `save_query_example` (links the example to the turn) |
+| `turn_id` | `save_turn` | web UI (links a thumbs-up example to the turn) |
 | `turn_metrics` | `save_turn` | front ends (the timing expander) |
-| `example_saved` | `save_query_example` | front ends ("Saved to query history") |
 | `metrics` | **every node**, through `timed()` | `save_turn` (summarized) |
 
 ### 3.5 The `timed()` wrapper and metrics
@@ -611,9 +611,9 @@ sequenceDiagram
     Note over R: LiveCall.finish(): close the live box and draw only the steps not shown yet
     G-->>R: validate_sql, execute_sql updates
     G->>O: answer: llm.invoke(prompt) (thinking + answer text streamed live)
-    G-->>R: answer, save_turn, save_query_example updates
-    R-->>W: steps (filled in place)
-    W->>W: st.rerun() (the sidebar now lists this thread first)
+    G-->>R: answer, save_turn updates
+    R-->>W: the turn (steps filled in place)
+    W->>W: st.rerun() (the sidebar lists this thread first; the reply gets its thumbs up)
 ```
 
 Section [4.18](#418-uiweb_chatpy) explains `LiveCall` and what happens when a run is stopped.
@@ -1043,6 +1043,7 @@ from different models can't be compared.
 | `sql_reasoning`, `answer_reasoning` | the model's thinking (shown in the UI, never re-prompted) |
 | `model` | chat model that answered |
 | `metrics` | `TurnMetrics` or None |
+| `id` | only on turns loaded from a store (`NotRequired`): the row id, which the web UI's thumbs up links its example to. Ignored by `append()` |
 
 Result **rows are never stored**, only the count. That keeps the table small and avoids copying
 data out of the business tables. That's also why a reopened conversation shows "N row(s) · result
@@ -1058,15 +1059,17 @@ this logic.
 Protocol is structural typing: any class with these methods *is* a `ChatStore` without
 inheriting. The two implementations:
 
-- **`InMemoryChatStore`** (`:67`): a dict `thread_id -> [(timestamp, turn)]`. Used by tests and by
-  eval runs. `.copy()` on the way in and out means callers can't change stored turns.
-- **`PostgresChatStore`** (`:90`):
-  - `load()` (`:96`): `SELECT … WHERE thread_id = :thread_id ORDER BY id DESC LIMIT :limit`, i.e.
+- **`InMemoryChatStore`** (`:68`): a dict `thread_id -> [(timestamp, turn)]`. Used by tests and by
+  eval runs. Copies on the way in and out mean callers can't change stored turns, and each stored
+  turn gets its `id`.
+- **`PostgresChatStore`** (`:92`):
+  - `load()` (`:98`): `SELECT … WHERE thread_id = :thread_id ORDER BY id DESC LIMIT :limit`, i.e.
     the *last* N turns, fetched newest-first and then `reversed()` to oldest-first. A `NULL` limit
     in Postgres means "no limit", so `limit=None` loads the whole thread. It then loads the turns'
     node metrics in one extra query (`_node_metrics`, `:165`, `WHERE turn_id IN :ids` with an
     *expanding* bind parameter that SQLAlchemy turns into `IN (…, …)`) and re-summarizes them.
-  - `append()` (`:119`): **one transaction** (`engine.begin()`) inserts the turn
+    Each turn keeps its row `id`.
+  - `append()` (`:118`): **one transaction** (`engine.begin()`) inserts the turn
     (`RETURNING id`), then all its `turn_metrics` rows in one `executemany` (a list of parameter
     dicts). `seq` is the node's position in the run. Either everything is saved or nothing is.
   - `threads()` (`:150`): one row per thread with `count(*)`, the first question
@@ -1095,14 +1098,15 @@ One SQL statement:
 
 ### 4.8 `history/queries.py`
 
-**Purpose.** "Learn from success". When a turn's SQL runs and returns rows, store (standalone
-question, SQL) with an embedding. Before writing new SQL, fetch the most similar stored pairs as
-extra examples.
+**Purpose.** "Learn from what users liked". When a user gives a reply a thumbs up in the web UI
+(only for a turn whose SQL ran and returned rows), store (standalone question, SQL) with an
+embedding. Before writing new SQL, fetch the most similar stored pairs as extra examples. The
+graph never adds to it: a human decides what's a good example.
 
-**Public API.** `PastQuery`, `QueryHistory` (Protocol: `add`, `search`),
-`InMemoryQueryHistory`, `PostgresQueryHistory` (+ `backfill`), `get_query_history()`,
-`normalize_question()`, `pick_best()`, and admin helpers `list_examples()`, `set_enabled()`,
-`StoredExample`.
+**Public API.** `PastQuery`, `Example`, `ExampleStatus`, `QueryHistory` (Protocol: `add`,
+`search`, `examples`, `status`, `hide`), `InMemoryQueryHistory`, `PostgresQueryHistory`
+(+ `backfill`), `get_query_history()`, `normalize_question()`, `pick_best()`, and admin helpers
+`list_examples()`, `set_enabled()`, `StoredExample`.
 
 **Table** `chat_memory.query_examples` (from `db/init/04-chat-memory.sh`): `id`, `turn_id`,
 `question`, `sql`, `row_count`, `embedding vector` (**no fixed dimension**, so rows from
@@ -1110,7 +1114,7 @@ different embedding models can live side by side), `embed_model`, `enabled`, `cr
 unique index on `(embed_model, md5(question), md5(sql))` prevents duplicates. It uses `md5`
 because a btree index entry can't hold arbitrarily long SQL text.
 
-#### `PostgresQueryHistory.add()` (`:117`)
+#### `PostgresQueryHistory.add()` (`:162`)
 
 ```sql
 INSERT INTO chat_memory.query_examples (turn_id, question, sql, row_count, embedding, embed_model)
@@ -1122,13 +1126,14 @@ ON CONFLICT (embed_model, md5(question), md5(sql)) DO NOTHING                  -
 ```
 
 - It's `INSERT … SELECT … WHERE` rather than `INSERT … VALUES` so that a condition can be added:
-  **(a)** a pair an admin *disabled* is never re-added, not even under a new embedding model.
+  **(a)** a pair that was *hidden* (web UI) or *disabled* (admin) is never re-added, not even
+  under a new embedding model.
 - **(b)** the same pair for the same model is stored once. `rowcount == 1` → `True` ("saved").
 - The vector is passed as text `'[0.1,0.2,…]'` (`_vector_literal`) and cast to `vector`. That
   needs no pgvector Python adapter.
 - The `CAST`s give psycopg types for parameters that may be `NULL` (`turn_id`).
 
-#### `PostgresQueryHistory.search()` (`:142`)
+#### `PostgresQueryHistory.search()` (`:187`)
 
 ```sql
 SELECT question, sql, 1 - (embedding <=> CAST(:embedding AS vector))       -- similarity
@@ -1143,7 +1148,7 @@ ORDER BY embedding <=> CAST(:embedding AS vector) LIMIT :limit             -- k 
   models means nothing.
 - It fetches `k * _OVERFETCH` (3×) candidates, because `pick_best` then drops some.
 
-#### `pick_best(candidates, k, min_similarity)` (`:47`)
+#### `pick_best(candidates, k, min_similarity)` (`:74`)
 
 Sort by similarity (descending), drop anything below `QUERY_HISTORY_MIN_SIMILARITY` (default
 0.75), keep **one per normalized question** (the same question may have been answered with
@@ -1153,21 +1158,36 @@ different SQL), stop at `k`. `normalize_question` is `casefold()` plus collapsin
 After this, `nodes.find_similar_queries` also drops any past query whose question is a curated
 few-shot example *already in the context*, so the model isn't shown the same example twice.
 
-#### `backfill()` (`:158`)
+#### What the web UI uses: `examples()`, `status()`, `hide()` (`:203`, `:214`, `:231`)
 
-For turns that succeeded (`sql IS NOT NULL AND error IS NULL AND row_count > 0`) and have no
-example yet for the current model (and aren't disabled), it calls `add()` for each. Run it after
-switching `OLLAMA_EMBED_MODEL`, since every past query needs a vector from the new model.
+A pair can be stored several times, once per embedding model, so these work **per (question,
+SQL) pair**, not per row:
+
+- `examples()`: `GROUP BY question, sql HAVING bool_and(enabled)`, newest first. One `Example` per
+  pair that isn't hidden (its `id` is the pair's first row). The Query examples page lists these.
+- `status(pairs)`: which of the given pairs are stored, as `"saved"` or `"hidden"` (a pair with any
+  disabled row counts as hidden, like `add()`'s rule (a)). The pairs go in as two arrays,
+  `unnest(CAST(:questions AS text[]), CAST(:sqls AS text[]))`, joined to the table: one query for
+  every reply on the chat page.
+- `hide(question, sql)`: `UPDATE … SET enabled = false WHERE enabled AND question = … AND sql = …`,
+  for every embedding model. Rows are never deleted.
+
+#### `backfill()` (`:241`)
+
+For stored pairs that aren't hidden and have no row yet for the current embedding model, it calls
+`add()` for each (with the first row's `turn_id` and `row_count`). Run it after switching
+`OLLAMA_EMBED_MODEL`, since every example needs a vector from the new model.
 
 #### Admin helpers
 
 - `list_examples(engine, include_disabled, limit)`: newest first, `WHERE enabled OR
-  :include_disabled`.
-- `set_enabled(engine, ids, enabled)`: `UPDATE … WHERE id IN :ids`. **Needs the admin engine**,
-  because the memory role has no `UPDATE`. That's deliberate: the app can only add history, and
-  only a human can switch examples off.
+  :include_disabled`. One entry per row, so a pair shows once per embedding model.
+- `set_enabled(engine, ids, enabled)`: `UPDATE … WHERE id IN :ids`. The CLI runs it with the admin
+  engine; it is the only way to bring back a hidden example. The memory role may only set
+  `enabled` (a column-level `GRANT UPDATE (enabled)`): it can hide, but never change or delete
+  an example.
 
-**`InMemoryQueryHistory`** (`:80`) does the same in Python (`_cosine` computes the similarity by
+**`InMemoryQueryHistory`** (`:108`) does the same in Python (`_cosine` computes the similarity by
 hand) for tests. It's also used, empty, by eval runs without `--with-history`.
 
 **Tests.** `tests/test_query_history.py`.
@@ -1390,13 +1410,8 @@ for runs that stopped early (`web_chat.unfinished_turn`).
 
 Builds the turn. If there's a `thread_id`, `store.append()` it, catching any exception (the answer
 is already produced, so a failed save is logged, not fatal). Always returns `history + [turn]`,
-`turn_id` (None if not saved) and `turn_metrics`.
-
-#### `save_query_example(state, *, query_history)` (`:265`)
-
-Saves only when **all** hold: there's a `thread_id`, a result, `row_count > 0` and SQL. Empty
-results aren't saved, because "0 rows" often means a wrong filter, and that makes a bad example.
-Failures are logged, not raised.
+`turn_id` (None if not saved) and `turn_metrics`. It is the last node: query examples are only
+saved by a user's thumbs up in the web UI, never by the graph.
 
 **Tests.** `tests/test_nodes.py` (each node with fakes).
 
@@ -1414,7 +1429,8 @@ Covered in full in section 3: routing ([3.2](#32-the-three-routing-functions)), 
   and share it across graphs.
 
 **Tests.** `tests/test_graph.py`: routing tables, happy path, retries, unavailable database,
-max retries, follow-ups, thread isolation, past-query retrieval, NO_SQL, and usage surviving
+max retries, follow-ups, thread isolation, past-query retrieval (and that runs never save
+examples), NO_SQL, and usage surviving
 streamed calls (`OllamaLikeModel` puts usage only on the last chunk, like ChatOllama).
 
 ---
@@ -1453,15 +1469,20 @@ update to steps:
 | `execute_sql` with result | `result` with a DataFrame |
 | `answer` | `thinking (answer)` (if any), then `answer` |
 | `save_turn` | `metrics` |
-| `save_query_example` | caption "Saved to query history…" when saved |
 
 The `attempts` argument is tracked by the caller (updates only contain `attempts` when
 `generate_sql` runs), which is why both front ends keep `attempts = update.get("attempts",
 attempts)`.
 
-**`steps_from_turn(turn)`** (`:146`) builds the steps for a **saved** turn (reopening a
+**`steps_from_turn(turn)`** (`:161`) builds the steps for a **saved** turn (reopening a
 conversation): model, interpreted, thinking, SQL or the NO_SQL note, "N row(s) · result rows
 aren't saved", error, answer thinking, answer, metrics.
+
+**`example_candidate(turn)`** (`:154`) decides whether a reply gets the web UI's thumbs up: only
+when the turn has SQL, no error and `row_count > 0`. Empty results are left out, because "0 rows"
+often means a wrong filter, which makes a bad example. It returns an `ExampleCandidate`
+(`:145`): the **standalone** question (what the SQL answers, so a follow-up like "And the
+lowest?" is stored in full), the SQL, the row count and the turn's `id`.
 
 Helpers:
 
@@ -1499,8 +1520,8 @@ with `IPython.display`.
 
 ### 4.17 `ui/web.py`
 
-**Purpose.** The Streamlit app: page, sidebar, session state, and wiring. Drawing a reply is
-`web_chat.py`'s job.
+**Purpose.** The Streamlit app: pages, sidebar, session state, the thumbs up, and wiring. Drawing
+a reply is `web_chat.py`'s job, and the Query examples page is `web_examples.py`.
 
 **How Streamlit runs code.** Streamlit **re-runs the whole script from the top** on every
 interaction (typing a question, clicking a button). Anything that must survive a rerun is kept in
@@ -1511,37 +1532,60 @@ sessions, `st.cache_data` is a cached return value).
 
 | Function | Cache | Holds |
 |---|---|---|
-| `_default_store()` `:59` | `cache_resource` | the `PostgresChatStore` |
-| `_shared_deps()` `:64` | `cache_resource` | retriever, query runner, chat store, query history: **built once**, so each model's graph doesn't open its own DB pools |
-| `_default_graph(model, thinking)` `:76` | `cache_resource`, **keyed by args** | one compiled graph per model, with `reasoning = OLLAMA_REASONING and thinking` |
-| `_default_models()` `:83` | `cache_data(ttl=60)` | `list_chat_models()`, or `None` if Ollama is unreachable (retried after 60 s) |
+| `_default_store()` `:71` | `cache_resource` | the `PostgresChatStore` |
+| `_default_query_history()` `:76` | `cache_resource` | the `PostgresQueryHistory`, shared by the graphs (search) and the thumbs up and Query examples page |
+| `_shared_deps()` `:81` | `cache_resource` | retriever, query runner, chat store, query history: **built once**, so each model's graph doesn't open its own DB pools |
+| `_default_graph(model, thinking)` `:93` | `cache_resource`, **keyed by args** | one compiled graph per model, with `reasoning = OLLAMA_REASONING and thinking` |
+| `_default_models()` `:100` | `cache_data(ttl=60)` | `list_chat_models()`, or `None` if Ollama is unreachable (retried after 60 s) |
 
 **Session state:** `thread_id` and `messages`: a list of `{"role": "user", "content": str}` and
-`{"role": "assistant", "content": list[Step]}`. On rerun, the chat is **redrawn from these
-steps**, without calling the agent again.
+`{"role": "assistant", "content": list[Step], "example": ExampleCandidate | None}`. On rerun,
+the chat is **redrawn from these steps**, without calling the agent again.
 
-**`main(graph_for=, store=, settings=, list_models=)`** (`:183`). All arguments are injectable, so
-`tests/test_web.py` runs the app with fakes through Streamlit's `AppTest`.
+**`main(graph_for=, store=, settings=, list_models=, query_history=)`** (`:309`). All arguments
+are injectable, so `tests/test_web.py` runs the app with fakes through Streamlit's `AppTest`.
+It calls `set_page_config`, then `st.navigation` with two pages, shown at the top of the sidebar:
+**Chat** (the default, `_chat_page`) and **Query examples** (`web_examples.examples_page`). The
+pages are functions that get the dependencies through a closure.
 
-1. `set_page_config`.
-2. First load of a tab: open the thread in the URL (`?thread=<id>`) or start a new one. The thread
+**`_chat_page`** (`:256`):
+
+1. First load of a tab: open the thread in the URL (`?thread=<id>`) or start a new one. The thread
    id lives in the URL, so a reload or a bookmark reopens the conversation.
-3. `_sidebar()`: "New chat" button, **model picker**, then up to 30 saved threads as one-line
+2. `_sidebar()`: "New chat" button, **model picker**, then up to 30 saved threads as one-line
    buttons (the current one `primary`, others `tertiary`; `on_click=_open_thread`). `SIDEBAR_CSS`
    left-aligns the button text, and relies on Streamlit's internal markup (check again after
    upgrading Streamlit).
-4. Redraw every stored message with `render_step`.
-5. On a new question: append the user message and an assistant message whose `steps` list starts
-   with the "Model `x`" step, then call `run_turn(...)`, which **fills that same list in place**.
-   Then `st.rerun()` so the sidebar shows this thread at the top.
+3. Redraw every stored message with `render_step`, and under each reply that has an `example`
+   candidate, its **thumbs up** (below).
+4. On a new question: append the user message and an assistant message whose `steps` list starts
+   with the "Model `x`" step, then call `run_turn(...)`, which **fills that same list in place**
+   and returns the turn. `example_candidate(turn)` goes into the message, then `st.rerun()`, so the
+   sidebar shows this thread at the top and the reply gets its thumbs up.
 
-**`_model_picker`** (`:123`): if the models can't be listed, it shows a warning and uses
+**The thumbs up** (`_example_statuses` `:206`, `_thumbs_up` `:231`, `_save_example` `:221`): each
+redraw asks `QueryHistory.status()` about every shown reply's (question, SQL) in **one query**.
+A reply shows a "Good answer" button (`on_click=_save_example`, which calls
+`QueryHistory.add(..., turn_id=)`), or "Saved as an example" once saved, or "Hidden from the query
+examples" if someone hid that pair (a hidden pair can't be saved again). Reading the status on
+every redraw, rather than remembering the click, means a pair hidden on the other page shows as
+hidden here too. A failed save shows a toast; a failed status read only drops the labels.
+
+**Query examples page** (`ui/web_examples.py`): `examples_page(query_history)` (`:69`) lists
+`QueryHistory.examples()` as bordered cards (question, SQL, date) with a search box.
+`filter_examples` (`:21`, pure) keeps the examples whose question or SQL contains every word,
+ignoring case. **Hide** is confirmed inline: the first click stores the example's id in session
+state (`PENDING_HIDE`), which swaps the button for "Hide" (primary) and "Cancel"; confirming calls
+`QueryHistory.hide()`. The page is a plain function, so its tests run it through its own `AppTest`
+script (`AppTest.switch_page` only works with file-based pages).
+
+**`_model_picker`** (`:143`): if the models can't be listed, it shows a warning and uses
 `OLLAMA_CHAT_MODEL` with `thinking=True` (capabilities unknown, so the configured reasoning
 setting is used as is). Otherwise a `selectbox` with `key="model"` keeps the choice in
 `st.session_state` per tab, defaulting to `OLLAMA_CHAT_MODEL` if the server has it.
 
-**`_open_thread`** (`:99`) loads every turn of the thread and rebuilds `messages` with
-`steps_from_turn`. If loading fails, it shows an error message instead of crashing.
+**`_open_thread`** (`:115`) loads every turn of the thread and rebuilds `messages` with
+`steps_from_turn` and `example_candidate`. If loading fails, it shows an error message instead of crashing.
 
 ---
 
@@ -1571,24 +1615,26 @@ language="sql")`, `st.error` and `st.dataframe`.
 - `streamed_steps()`: what was streamed so far, as steps, **without Streamlit calls** (used while
   a run is being stopped).
 
-**`run_turn(graph, question, thread_id, steps, max_retries, *, save_unfinished=None)`** (`:143`):
+**`run_turn(graph, question, thread_id, steps, max_retries, *, save_unfinished=None) -> Turn`**
+(`:144`):
 
 ```text
-state = {"question", "thread_id"}; error = INTERRUPTED; saved = False
+state = {"question", "thread_id"}; error = INTERRUPTED; turn = None
 try:
     for mode, payload in graph.stream(..., stream_mode=["updates", "messages"]):
         "messages": if the chunk's langgraph_node is generate_sql/answer → LiveCall.add()
         "updates":  for each node update:
             merge into local `state` (metrics appended, like the graph's reducer)
-            saved |= node == "save_turn"
+            if node == "save_turn": turn = the turn it appended to history, + its id
             steps_from_update(...) → LiveCall.finish() if it's the live node → render pending
             steps.extend(new)            # in place: survives an interruption
 except Exception as e:                   # e.g. Ollama unreachable mid-run
     error = str(e); keep streamed thinking; show "The agent failed" error step
 finally:
-    if not saved:
+    if turn is None:
         if error == INTERRUPTED: add the streamed text + an "Interrupted" step (no st.* calls)
-        save_unfinished(unfinished_turn(state, error, live))
+        turn = unfinished_turn(state, error, live); save_unfinished(turn)
+return turn                              # web.py decides the thumbs up from it
 ```
 
 Why it's built like this:
@@ -1617,7 +1663,7 @@ because a Windows console may use a code page like cp874.
 | Command | Function | Does | DB role |
 |---|---|---|---|
 | `rag-sql-index` | `index_main` `:46` | `retrieval.build_index()` | admin |
-| `rag-sql-history backfill` | `history_main` `:53` | `PostgresQueryHistory.backfill()` | memory |
+| `rag-sql-history backfill` | `history_main` `:53` | `PostgresQueryHistory.backfill()`: embed the stored examples for the current embedding model | memory |
 | `rag-sql-history list [--all] [--sql] [--limit N]` | same | `list_examples()`, printed as a table | memory |
 | `rag-sql-history disable\|enable ID...` | same | `set_enabled()` | **admin** |
 | `rag-sql-metrics [--days N] [--model M]` | `metrics_main` `:92` | `turn_stats()`, printed per model | memory |
@@ -1750,8 +1796,9 @@ Other protections:
 - **Chat memory is walled off.** The reader role has no grant on `chat_memory`, `config.py`
   refuses `chat_memory` in `DB_SCHEMAS`, and the memory role can only `SELECT`/`INSERT` the three
   tables with fixed, parameterized SQL.
-- **History is append-only.** Nothing in the app can update or delete it. Disabling an example
-  needs the admin role.
+- **History is append-only.** Nothing in the app can delete it, or update anything but one column:
+  the memory role may set `query_examples.enabled` (a column-level grant), so the web UI can hide
+  an example. Bringing one back (`rag-sql-history enable`) is left to the admin.
 - **The web container has no admin credentials.** `docker-compose.yml` blanks `POSTGRES_USER` and
   `POSTGRES_PASSWORD` for `web`, `.dockerignore` keeps `.env` out of the image, the port is bound
   to `127.0.0.1` (Streamlit has no login, and the sidebar shows every conversation), and the
@@ -1768,7 +1815,8 @@ Other protections:
 | `execute_sql` | `DBAPIError` (unavailable) | `db_unavailable=True` → straight to `answer` | fixed "database is unavailable" answer |
 | routers | retries used up | → `answer` | fixed "couldn't produce a working SQL query" answer |
 | `find_similar_queries` | anything | logged (warning), `[]` | nothing: works without past queries |
-| `save_turn`, `save_query_example` | anything | logged (exception), not saved | the answer, as normal |
+| `save_turn` | anything | logged (exception), not saved | the answer, as normal |
+| web: thumbs up, hide an example | anything | logged, toast | "Couldn't save the example." / "Couldn't hide the example." |
 | `retrieve_context`, model calls | anything (no index, Ollama down) | **propagates**, run fails | notebook: traceback. web: "The agent failed" + saved as an unfinished turn. eval: `agent_error` |
 | web: list/load threads, list models | anything | logged, warning in sidebar | "Couldn't load chat history" etc. |
 
@@ -1908,7 +1956,7 @@ erDiagram
 | **Standalone question** | A follow-up rewritten to make sense on its own ("And the lowest?" → "Which department has the lowest average salary?"). |
 | **Context** | The retrieved documents: table descriptions + few-shot examples. |
 | **Few-shot example** | A curated question → SQL pair from `examples/few_shot.yaml`. |
-| **Past query / query example** | A (question, SQL) pair the agent itself produced successfully, stored in `query_examples`. |
+| **Past query / query example** | A (question, SQL) pair the agent produced and a user marked as good (thumbs up in the web UI), stored in `query_examples`. Hidden ones are kept but never used. |
 | **NO_SQL** | What the SQL model replies when the message isn't about the data. |
 | **Attempt** | One SQL generation. `attempts` = number of generations so far. |
 | **Retry** | A generation after a failed one. Total generations ≤ `MAX_SQL_RETRIES + 1`. |

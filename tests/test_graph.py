@@ -95,7 +95,6 @@ def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
         "execute_sql",
         "answer",
         "save_turn",
-        "save_query_example",
     ]
     assert state["standalone_question"] == "Who earns the most?"
     assert state["sql"].rstrip().endswith("LIMIT 51")  # row_limit + 1, to detect truncation
@@ -105,7 +104,6 @@ def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
     # No thread_id: the turn is returned in state but not saved.
     assert [t["answer"] for t in state["history"]] == ["Employee_1."]
     assert chat_store.threads() == []
-    assert state["example_saved"] is False
 
 
 def test_every_node_run_is_timed(settings, retriever, chat_store, stores) -> None:
@@ -137,7 +135,6 @@ def test_every_node_run_is_timed(settings, retriever, chat_store, stores) -> Non
         ("execute_sql", 2),
         ("answer", 2),
         ("save_turn", 2),
-        ("save_query_example", 2),
     ]
     assert all(m["ms"] >= 0 for m in state["metrics"])
     assert [m["node"] for m in state["metrics"] if m["input_tokens"]] == [
@@ -181,7 +178,7 @@ def test_retries_after_invalid_then_db_error(
     order, state = _nodes_run(graph, "q")
 
     assert order.count("generate_sql") == 3
-    assert order[-3:] == ["answer", "save_turn", "save_query_example"]
+    assert order[-2:] == ["answer", "save_turn"]
     assert state["attempts"] == 3
     assert state["error"] is None
     assert state["answer"] == "Done."
@@ -198,7 +195,7 @@ def test_unavailable_database_is_not_retried(settings, retriever, chat_store, st
     order, state = _nodes_run(graph, "q", thread_id="t1")
 
     assert order.count("generate_sql") == 1
-    assert order[-4:] == ["execute_sql", "answer", "save_turn", "save_query_example"]
+    assert order[-3:] == ["execute_sql", "answer", "save_turn"]
     assert state["db_unavailable"] is True
     assert state["answer"].startswith("I couldn't run the query because the database")
     [saved] = chat_store.load("t1")
@@ -293,7 +290,9 @@ def test_threads_are_isolated(settings, retriever, ok_runner, chat_store, stores
     assert [t["question"] for t in chat_store.load("b")] == ["second"]
 
 
-def test_past_query_is_retrieved_in_another_thread(settings, retriever, ok_runner, stores) -> None:
+def test_past_query_is_retrieved_in_another_thread(
+    settings, retriever, ok_runner, stores, query_history
+) -> None:
     llm = fake_llm(
         "```sql\nSELECT department, avg(salary) AS avg_salary FROM employees GROUP BY 1\n```",
         "Per department.",
@@ -306,7 +305,8 @@ def test_past_query_is_retrieved_in_another_thread(settings, retriever, ok_runne
     recorder = PromptRecorder()
 
     _, first = _nodes_run(graph, "What is the average salary per department?", "a")
-    assert first["example_saved"] is True
+    # A thumbs up in the web UI saves it.
+    query_history.add(first["standalone_question"], first["sql"], first["result"].row_count)
     order, second = _nodes_run(graph, "Average salary by department?", "b", [recorder])
 
     assert order.index("find_similar_queries") == order.index("retrieve_context") + 1
@@ -318,24 +318,24 @@ def test_past_query_is_retrieved_in_another_thread(settings, retriever, ok_runne
     assert "AS avg_salary" in sql_prompt
 
 
-def test_empty_result_is_not_saved_as_example(settings, retriever, stores, query_history) -> None:
-    llm = fake_llm("SELECT 1", "Nothing found.")
+def test_runs_never_save_query_examples(
+    settings, retriever, ok_runner, stores, query_history
+) -> None:
     graph = build_graph(
-        llm=llm,
+        llm=fake_llm("SELECT 1", "One row."),
         retriever=retriever,
-        query_runner=lambda _sql: QueryResult(columns=["a"]),
+        query_runner=ok_runner,
         settings=settings,
         **stores,
     )
     _, state = _nodes_run(graph, "Average salary of remote employees?", "a")
 
-    assert state["example_saved"] is False
-    assert query_history.search("Average salary of remote employees?", 5, 0.0) == []
+    # Even a successful run: examples are only added by a user's thumbs up.
+    assert state["result"].row_count == 1
+    assert query_history.examples() == []
 
 
-def test_no_sql_question_runs_nothing_and_saves_no_example(
-    settings, retriever, chat_store, stores, query_history
-) -> None:
+def test_no_sql_question_runs_nothing(settings, retriever, chat_store, stores) -> None:
     def must_not_run(_sql: str) -> QueryResult:
         raise AssertionError("no query should run")
 
@@ -354,7 +354,6 @@ def test_no_sql_question_runs_nothing_and_saves_no_example(
         "generate_sql",
         "answer",
         "save_turn",
-        "save_query_example",
     ]
     assert state["answer"] == "Hi! I answer questions about the employees table."
     assert (state["no_sql"], state["sql"], state["attempts"]) == (True, None, 1)
@@ -362,8 +361,6 @@ def test_no_sql_question_runs_nothing_and_saves_no_example(
     assert "Tables: employees" in recorder.prompts[1]
     [turn] = chat_store.load("t1")
     assert (turn["sql"], turn["error"], turn["row_count"]) == (None, None, None)
-    assert state["example_saved"] is False
-    assert query_history.search("hello, who are you?", 5, 0.0) == []
 
 
 class OllamaLikeModel(BaseChatModel):

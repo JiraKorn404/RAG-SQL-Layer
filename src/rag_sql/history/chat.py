@@ -10,7 +10,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol, TypedDict
+from typing import NotRequired, Protocol, TypedDict
 
 from sqlalchemy import Connection, Engine, bindparam, text
 
@@ -30,6 +30,7 @@ class Turn(TypedDict):
     answer_reasoning: str | None  # model thinking behind the answer, if any
     model: str | None  # chat model that answered
     metrics: TurnMetrics | None  # time and tokens per node; None for turns saved without them
+    id: NotRequired[int]  # set on turns loaded from a store (ignored when appending)
 
 
 @dataclass(frozen=True)
@@ -75,8 +76,9 @@ class InMemoryChatStore:
         return _last([turn.copy() for _, turn in self._rows.get(thread_id, [])], limit)
 
     def append(self, thread_id: str, turn: Turn) -> int:
-        self._rows.setdefault(thread_id, []).append((datetime.now(UTC), turn.copy()))
         self._count += 1
+        stored = Turn(**{**turn, "id": self._count})
+        self._rows.setdefault(thread_id, []).append((datetime.now(UTC), stored))
         return self._count
 
     def threads(self, limit: int = 20) -> list[ThreadSummary]:
@@ -111,14 +113,11 @@ class PostgresChatStore:
                 .all()
             )
             nodes = _node_metrics(conn, [row["id"] for row in rows])
-        return [
-            Turn(**{k: v for k, v in row.items() if k != "id"}, metrics=summarize(nodes[row["id"]]))
-            for row in reversed(rows)
-        ]
+        return [Turn(**row, metrics=summarize(nodes[row["id"]])) for row in reversed(rows)]
 
     def append(self, thread_id: str, turn: Turn) -> int:
         """Save the turn and its node metrics, in one transaction."""
-        fields = {k: v for k, v in turn.items() if k != "metrics"}
+        fields = {k: v for k, v in turn.items() if k not in ("metrics", "id")}
         with self._engine.begin() as conn:
             turn_id = conn.execute(
                 text(

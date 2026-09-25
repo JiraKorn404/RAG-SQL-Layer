@@ -15,6 +15,10 @@ def test_in_memory_store_load_order_and_limit() -> None:
 def test_in_memory_store_append_returns_ids() -> None:
     store = InMemoryChatStore()
     assert [store.append("t", make_turn(q)) for q in ("a", "b")] == [1, 2]
+    # Loaded turns carry their id; an id in an appended turn is ignored.
+    assert [t["id"] for t in store.load("t")] == [1, 2]
+    store.append("u", store.load("t")[0])
+    assert store.load("u")[0]["id"] == 3
 
 
 def test_in_memory_store_returns_copies() -> None:

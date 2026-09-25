@@ -1,5 +1,7 @@
-"""Streamlit chat app: page, sidebar (conversations, model picker) and session state. Each reply
-is drawn by web_chat.py, which streams the agent's steps and the model's thinking live.
+"""Streamlit app: pages, sidebar (conversations, model picker) and session state. The Chat page
+draws each reply with web_chat.py, which streams the agent's steps and the model's thinking live;
+a reply whose SQL found rows gets a thumbs up, which saves it as a query example. The Query
+examples page (web_examples.py) lists them.
 
 Run with `uv run streamlit run src/rag_sql/ui/web.py`, or in Docker (the compose service `web`).
 """
@@ -14,12 +16,20 @@ from langgraph.graph.state import CompiledStateGraph
 from rag_sql.agent.graph import build_graph, default_query_runner
 from rag_sql.config import Settings, get_settings
 from rag_sql.history.chat import ChatStore, ThreadSummary, get_chat_store, new_thread_id
-from rag_sql.history.queries import get_query_history
+from rag_sql.history.queries import ExampleStatus, QueryHistory, get_query_history
 from rag_sql.llm import ChatModelInfo, get_chat_model, list_chat_models
 from rag_sql.retrieval import get_retriever
 from rag_sql.tracing import run_config
-from rag_sql.ui.steps import Step, escape_md, model_step, steps_from_turn
+from rag_sql.ui.steps import (
+    ExampleCandidate,
+    Step,
+    escape_md,
+    example_candidate,
+    model_step,
+    steps_from_turn,
+)
 from rag_sql.ui.web_chat import render_step, run_turn
+from rag_sql.ui.web_examples import examples_page
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +73,11 @@ def _default_store() -> ChatStore:
 
 
 @st.cache_resource
+def _default_query_history() -> QueryHistory:
+    return get_query_history()
+
+
+@st.cache_resource
 def _shared_deps() -> dict[str, Any]:
     """Dependencies every model's graph shares, so a model doesn't open its own DB pools."""
     s = get_settings()
@@ -70,7 +85,7 @@ def _shared_deps() -> dict[str, Any]:
         "retriever": get_retriever(s),
         "query_runner": default_query_runner(s),
         "chat_store": _default_store(),
-        "query_history": get_query_history(s),
+        "query_history": _default_query_history(),
     }
 
 
@@ -116,7 +131,11 @@ def _open_thread(store: ChatStore, thread_id: str) -> None:
         for turn in turns
         for message in (
             {"role": "user", "content": turn["question"]},
-            {"role": "assistant", "content": steps_from_turn(turn)},
+            {
+                "role": "assistant",
+                "content": steps_from_turn(turn),
+                "example": example_candidate(turn),
+            },
         )
     ]
 
@@ -181,23 +200,66 @@ def _sidebar(
     return model
 
 
-def main(
-    graph_for: Callable[[ChatModelInfo], CompiledStateGraph] | None = None,
-    store: ChatStore | None = None,
-    settings: Settings | None = None,
-    list_models: Callable[[], list[ChatModelInfo] | None] | None = None,
+# --- thumbs up -----------------------------------------------------------------------------------
+
+
+def _example_statuses(
+    query_history: QueryHistory, messages: list[dict[str, Any]]
+) -> dict[tuple[str, str], ExampleStatus]:
+    """Whether each reply's question + SQL is already saved (or hidden): one query per redraw, so
+    a change on the Query examples page shows here too."""
+    pairs = [(c.question, c.sql) for m in messages if (c := m.get("example"))]
+    if not pairs:
+        return {}
+    try:
+        return query_history.status(pairs)
+    except Exception:
+        logger.exception("Could not read the query example status")
+        return {}
+
+
+def _save_example(query_history: QueryHistory, candidate: ExampleCandidate) -> None:
+    try:
+        query_history.add(
+            candidate.question, candidate.sql, candidate.row_count, turn_id=candidate.turn_id
+        )
+    except Exception:
+        logger.exception("Could not save the query example")
+        st.toast("Couldn't save the example.", icon=":material/error:")
+
+
+def _thumbs_up(
+    query_history: QueryHistory,
+    candidate: ExampleCandidate,
+    status: ExampleStatus | None,
+    key: str,
 ) -> None:
-    """The app. Pass fakes to run it without Postgres or Ollama (tests).
+    if status == "saved":
+        st.caption(":material/thumb_up: Saved as an example for similar questions")
+    elif status == "hidden":
+        st.caption(":material/visibility_off: Hidden from the query examples, can't be saved again")
+    else:
+        st.button(
+            "Good answer",
+            key=key,
+            icon=":material/thumb_up:",
+            type="tertiary",
+            help="Save this question and its SQL as an example for similar questions",
+            on_click=_save_example,
+            args=(query_history, candidate),
+        )
 
-    `graph_for` builds the agent graph for a chosen model; `list_models` returns the chat models
-    to choose from, or None when the server can't be reached.
-    """
-    st.set_page_config(page_title="RAG-SQL chat", page_icon=":material/database:", layout="wide")
-    store = store or _default_store()
-    settings = settings or get_settings()
-    graph_for = graph_for or (lambda m: _default_graph(m.name, m.thinking))
-    list_models = list_models or _default_models
 
+# --- pages ---------------------------------------------------------------------------------------
+
+
+def _chat_page(
+    graph_for: Callable[[ChatModelInfo], CompiledStateGraph],
+    store: ChatStore,
+    settings: Settings,
+    list_models: Callable[[], list[ChatModelInfo] | None],
+    query_history: QueryHistory,
+) -> None:
     if "thread_id" not in st.session_state:
         if thread_id := st.query_params.get("thread"):
             _open_thread(store, thread_id)
@@ -206,13 +268,18 @@ def main(
 
     model = _sidebar(store, settings, list_models())
 
-    for message in st.session_state.messages:
+    statuses = _example_statuses(query_history, st.session_state.messages)
+    for i, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             if message["role"] == "user":
                 st.markdown(escape_md(message["content"]))
-            else:
-                for step in message["content"]:
-                    render_step(step)
+                continue
+            for step in message["content"]:
+                render_step(step)
+            if candidate := message.get("example"):
+                status = statuses.get((candidate.question, candidate.sql))
+                key = f"thumb-{st.session_state.thread_id}-{i}"
+                _thumbs_up(query_history, candidate, status, key)
 
     if question := st.chat_input("Ask a question about the database"):
         steps = [model_step(model.name)]
@@ -225,7 +292,7 @@ def main(
         thread_id = st.session_state.thread_id
         with st.chat_message("assistant"):
             render_step(steps[0])
-            run_turn(
+            turn = run_turn(
                 graph_for(model),
                 question,
                 thread_id,
@@ -234,7 +301,50 @@ def main(
                 config=run_config("web", session_id=thread_id, model=model.name, settings=settings),
                 save_unfinished=lambda turn: store.append(thread_id, {**turn, "model": model.name}),
             )
-        st.rerun()  # redraw the sidebar, which now lists this conversation first
+        st.session_state.messages[-1]["example"] = example_candidate(turn)
+        # Redraw: the sidebar now lists this conversation first, and the reply gets its thumbs up.
+        st.rerun()
+
+
+def main(
+    graph_for: Callable[[ChatModelInfo], CompiledStateGraph] | None = None,
+    store: ChatStore | None = None,
+    settings: Settings | None = None,
+    list_models: Callable[[], list[ChatModelInfo] | None] | None = None,
+    query_history: QueryHistory | None = None,
+) -> None:
+    """The app. Pass fakes to run it without Postgres or Ollama (tests).
+
+    `graph_for` builds the agent graph for a chosen model; `list_models` returns the chat models
+    to choose from, or None when the server can't be reached; `query_history` stores the query
+    examples saved with a thumbs up.
+    """
+    st.set_page_config(page_title="RAG-SQL chat", page_icon=":material/database:", layout="wide")
+    store = store or _default_store()
+    settings = settings or get_settings()
+    graph_for = graph_for or (lambda m: _default_graph(m.name, m.thinking))
+    list_models = list_models or _default_models
+    if query_history is None:
+        query_history = _default_query_history()
+
+    page = st.navigation(
+        [
+            st.Page(
+                lambda: _chat_page(graph_for, store, settings, list_models, query_history),
+                title="Chat",
+                icon=":material/chat:",
+                url_path="chat",
+                default=True,
+            ),
+            st.Page(
+                lambda: examples_page(query_history),
+                title="Query examples",
+                icon=":material/thumb_up:",
+                url_path="examples",
+            ),
+        ]
+    )
+    page.run()
 
 
 if __name__ == "__main__":

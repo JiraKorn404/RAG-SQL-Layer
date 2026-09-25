@@ -17,7 +17,7 @@ class AgentState(TypedDict, total=False):
     question: str
     standalone_question: str  # question rewritten to stand on its own; == question on turn 1
     context: list[Document]  # retrieved table docs + few-shot example docs
-    similar_queries: list[PastQuery]  # similar past successful queries, best first
+    similar_queries: list[PastQuery]  # similar past queries users marked as good, best first
     reasoning: str | None  # model thinking behind the latest SQL, if the model produced any
     sql: str | None  # latest SQL (normalized by validate_sql once it passes)
     no_sql: bool  # the model replied NO_SQL: not a question about the data, so nothing runs
@@ -28,7 +28,6 @@ class AgentState(TypedDict, total=False):
     answer: str
     answer_reasoning: str | None  # model thinking behind the answer, if the model produced any
     turn_id: int | None  # id of the saved chat turn
-    example_saved: bool  # whether this turn was added to the query history
     # One per node run, added by the timing wrapper in graph.py; the reducer appends, so each
     # SQL attempt keeps its own entries.
     metrics: Annotated[list[NodeMetric], operator.add]

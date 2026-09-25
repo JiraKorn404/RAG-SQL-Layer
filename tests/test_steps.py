@@ -2,7 +2,14 @@ import pytest
 
 from rag_sql.db.query import QueryResult
 from rag_sql.metrics import node_metric, summarize
-from rag_sql.ui.steps import NO_SQL_NOTE, escape_md, steps_from_turn, steps_from_update
+from rag_sql.ui.steps import (
+    NO_SQL_NOTE,
+    ExampleCandidate,
+    escape_md,
+    example_candidate,
+    steps_from_turn,
+    steps_from_update,
+)
 from tests.conftest import TABLE_DOC, make_turn
 
 
@@ -82,9 +89,30 @@ def test_result_step_has_dataframe_and_truncation_note() -> None:
     assert "truncated" in step.text
 
 
-def test_query_example_caption_only_when_saved() -> None:
-    assert _steps("save_query_example", {"example_saved": False}) == []
-    assert len(_steps("save_query_example", {"example_saved": True})) == 1
+def test_example_candidate_is_the_standalone_question_and_sql() -> None:
+    turn = make_turn("And per city?", "SELECT city FROM employees") | {
+        "standalone": "Average salary per city?",
+        "row_count": 4,
+        "id": 7,
+    }
+    assert example_candidate(turn) == ExampleCandidate(
+        "Average salary per city?", "SELECT city FROM employees", 4, 7
+    )
+    # Turns not loaded from a store have no id yet.
+    assert example_candidate(make_turn("Q?")).turn_id is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sql": None, "row_count": None, "error": "boom"},  # every attempt failed
+        {"row_count": 0},  # no rows
+        {"error": "Interrupted"},  # the run didn't finish
+        {"sql": None, "row_count": None},  # NO_SQL: not a question about the data
+    ],
+)
+def test_no_example_candidate_without_rows(overrides) -> None:
+    assert example_candidate(make_turn("Q?") | overrides) is None
 
 
 def test_answer_step_includes_its_thinking() -> None:
