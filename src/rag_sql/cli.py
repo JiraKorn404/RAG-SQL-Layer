@@ -12,6 +12,7 @@ rag-sql-history disable|enable ID...
 rag-sql-metrics [--days N] [--model M]
                                    latency, tokens and success of saved turns, per model
 rag-sql-eval run [--models A,B] [--tags T,U] [--limit N] [--repeat K] [--with-history]
+                 [--router-only]
                                    run the evaluation cases; one JSON file per model in
                                    evaluation/results/ (not committed)
 rag-sql-eval compare OLD.json NEW.json
@@ -133,6 +134,11 @@ def eval_main(argv: list[str] | None = None) -> None:
     run.add_argument("--limit", type=int, help="only the first N cases")
     run.add_argument("--repeat", type=int, default=1, help="run each case N times")
     run.add_argument("--with-history", action="store_true", help="use past queries as examples")
+    run.add_argument(
+        "--router-only",
+        action="store_true",
+        help="run only the router (no database or SQL model): check the intent it chooses",
+    )
     run.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
     run.add_argument("--out", type=Path, default=DEFAULT_OUT_DIR)
     diff = commands.add_parser("compare", help="compare two result files")
@@ -151,6 +157,7 @@ def eval_main(argv: list[str] | None = None) -> None:
                     limit=args.limit,
                     repeat=args.repeat,
                     with_history=args.with_history,
+                    router_only=args.router_only,
                 )
             )
         else:

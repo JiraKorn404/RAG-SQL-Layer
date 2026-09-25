@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_chat_model: str = "qwen3:14b"
+    # Model of the router agent (question -> intent + standalone question). Empty: the chat model,
+    # with thinking off.
+    ollama_router_model: str = ""
     ollama_embed_model: str = "nomic-embed-text"
     ollama_reasoning: bool = True
 
@@ -48,7 +51,7 @@ class Settings(BaseSettings):
     vector_collection: str = "schema_docs"
     retrieval_k: int = Field(6, gt=0)
     # Schemas whose tables are indexed and shown to the model (comma-separated in .env)
-    db_schemas: Annotated[tuple[str, ...], NoDecode] = ("public", "imba", "retail")
+    db_schemas: Annotated[tuple[str, ...], NoDecode] = ("retail",)
 
     # Chat history: earlier turns shown to the model (0 = none; turns are still saved)
     chat_history_turns: int = Field(5, ge=0)

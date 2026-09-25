@@ -11,15 +11,17 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
 
-from rag_sql.agent.graph import build_graph, default_query_runner
+from rag_sql.agent import nodes
+from rag_sql.agent.graph import build_graph, default_query_runner, routing_model
+from rag_sql.agent.prompts import prompt_version
 from rag_sql.config import Settings, get_settings
 from rag_sql.db.query import QueryResult, validate_sql
 from rag_sql.evaluation.cases import DEFAULT_CASES_PATH, EvalCase, load_cases, select_cases
 from rag_sql.evaluation.results import DEFAULT_OUT_DIR, CaseResult, format_report, write_results
-from rag_sql.evaluation.scoring import Outcome, compare, is_ordered
+from rag_sql.evaluation.scoring import compare, is_ordered, route_outcome
 from rag_sql.history.chat import InMemoryChatStore
 from rag_sql.history.queries import InMemoryQueryHistory, get_query_history
 from rag_sql.llm import ChatModelInfo, get_chat_model, get_embeddings, list_chat_models
@@ -61,8 +63,9 @@ def run_case(
     run: int = 1,
     config: RunnableConfig | None = None,
 ) -> CaseResult:
-    """Run one case. `expected` is the reference result; None for a no_sql case, which is correct
-    only when the agent replied NO_SQL. `config` is passed to the graph run (tracing)."""
+    """Run one case. `expected` is the reference result, None for a case without SQL (chat or
+    clarify). The outcome starts from the router's intent: for a case that needs SQL, the SQL
+    result is compared once the routing was right. `config` is passed to the graph run (tracing)."""
     start = time.perf_counter()
     history = [turn.to_turn() for turn in case.history]
     try:
@@ -80,18 +83,20 @@ def run_case(
             attempts=0,
             seconds=time.perf_counter() - start,
             metrics=None,
+            expected=case.kind,
         )
 
     result: QueryResult | None = state.get("result")
-    outcome: Outcome
-    if expected is None or case.sql is None:
-        outcome = "correct" if state.get("no_sql") else "unneeded_sql"
-    elif state.get("no_sql"):
-        outcome = "declined"
-    elif result is not None:
-        outcome = compare(expected, result, ordered=is_ordered(case.sql))
-    else:
-        outcome = "db_unavailable" if state.get("db_unavailable") else "sql_failed"
+    # A graph without a router has no intent: no_sql then means it treated the message as chat.
+    intent = state.get("intent") or ("chat" if state.get("no_sql") else "data")
+    outcome = route_outcome(case.kind, intent)
+    if case.kind == "sql" and outcome == "correct":
+        if expected is None or case.sql is None:
+            raise EvalError(f"Case {case.id!r} needs a reference result")
+        if result is not None:
+            outcome = compare(expected, result, ordered=is_ordered(case.sql))
+        else:
+            outcome = "db_unavailable" if state.get("db_unavailable") else "sql_failed"
     return CaseResult(
         case_id=case.id,
         tags=list(case.tags),
@@ -103,7 +108,68 @@ def run_case(
         attempts=state.get("attempts", 0),
         seconds=time.perf_counter() - start,
         metrics=state.get("turn_metrics"),
+        expected=case.kind,
+        intent=state.get("intent"),
+        standalone=state.get("standalone_question"),
     )
+
+
+def run_router_case(router: Runnable, case: EvalCase, *, run: int = 1) -> CaseResult:
+    """Run only the router on a case: no retrieval, SQL or database. The outcome is "correct" when
+    it chose the intent the case expects (for a case that needs SQL too: the SQL isn't run)."""
+    start = time.perf_counter()
+    history = [turn.to_turn() for turn in case.history]
+    try:
+        update = nodes.route_question({"question": case.question, "history": history}, llm=router)
+    except Exception as e:
+        logger.warning("Router failed on case %s", case.id, exc_info=True)
+        return CaseResult(
+            case.id,
+            list(case.tags),
+            run,
+            "agent_error",
+            None,
+            str(e) or type(e).__name__,
+            "",
+            0,
+            time.perf_counter() - start,
+            None,
+            expected=case.kind,
+        )
+    return CaseResult(
+        case_id=case.id,
+        tags=list(case.tags),
+        run=run,
+        outcome=route_outcome(case.kind, update["intent"]),
+        sql=None,
+        error=None,
+        answer="",
+        attempts=0,
+        seconds=time.perf_counter() - start,
+        metrics=None,
+        expected=case.kind,
+        intent=update["intent"],
+        standalone=update["standalone_question"],
+    )
+
+
+def run_router_cases(
+    router: Runnable, cases: list[EvalCase], *, repeat: int = 1
+) -> list[CaseResult]:
+    results = []
+    for run in range(1, repeat + 1):
+        for case in cases:
+            result = run_router_case(router, case, run=run)
+            results.append(result)
+            logger.info(
+                "[%d/%d] %s: %s (%s)",
+                len(results),
+                len(cases) * repeat,
+                case.id,
+                result.outcome,
+                result.intent,
+            )
+    return results
 
 
 def run_cases(
@@ -165,7 +231,36 @@ def eval_graph(model: ChatModelInfo, settings: Settings, *, with_history: bool, 
 
 def case_config(case: EvalCase, *, eval_id: str, model: str, settings: Settings) -> RunnableConfig:
     """Tracing config of one case's run: one Langfuse session per evaluation, tagged by case."""
-    return run_config("eval", session_id=eval_id, model=model, tags=[case.id], settings=settings)
+    tags = [case.id, f"prompts:{prompt_version()}"]
+    return run_config("eval", session_id=eval_id, model=model, tags=tags, settings=settings)
+
+
+def _evaluate_routers(
+    chosen: list[ChatModelInfo],
+    cases: list[EvalCase],
+    settings: Settings,
+    cases_path: Path,
+    out_dir: Path,
+    repeat: int,
+) -> str:
+    reports = []
+    for model in chosen:
+        llm = get_chat_model(
+            settings, model=model.name, reasoning=settings.ollama_reasoning and model.thinking
+        )
+        results = run_router_cases(routing_model(llm, settings), cases, repeat=repeat)
+        path = write_results(
+            out_dir,
+            model.name,
+            results,
+            settings=settings,
+            cases_path=cases_path,
+            with_history=False,
+            repeat=repeat,
+            router_only=True,
+        )
+        reports.append(f"{format_report(model.name, results, router_only=True)}\n  -> {path}")
+    return "\n\n".join(reports)
 
 
 def evaluate(
@@ -177,15 +272,22 @@ def evaluate(
     limit: int | None = None,
     repeat: int = 1,
     with_history: bool = False,
+    router_only: bool = False,
     settings: Settings | None = None,
 ) -> str:
     """Run the selected cases against each model (default OLLAMA_CHAT_MODEL), write one result
-    file per model to `out_dir`, and return the reports."""
+    file per model to `out_dir`, and return the reports.
+
+    With `router_only`, only the router runs (no database, retrieval or SQL model): a quick check
+    of the intent it chooses and of its rewrite of each question.
+    """
     s = settings or get_settings()
     cases = select_cases(load_cases(cases_path), tags=tags, limit=limit)
     if not cases:
         raise EvalError("No cases selected")
     chosen = resolve_models(models or [s.ollama_chat_model], s)
+    if router_only:
+        return _evaluate_routers(chosen, cases, s, cases_path, out_dir, repeat)
     query_runner = default_query_runner(s)
     expected = reference_results(cases, query_runner, s.sql_row_limit)
     shared = {

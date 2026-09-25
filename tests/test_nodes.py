@@ -1,3 +1,4 @@
+import pytest
 from langchain_core.messages import AIMessage
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -6,7 +7,14 @@ from rag_sql.db.query import QueryResult
 from rag_sql.history.chat import InMemoryChatStore
 from rag_sql.history.queries import InMemoryQueryHistory
 from rag_sql.metrics import node_metric
-from tests.conftest import EXAMPLE_DOC, TABLE_DOC, KeywordEmbeddings, fake_llm, make_turn
+from tests.conftest import (
+    EXAMPLE_DOC,
+    TABLE_DOC,
+    KeywordEmbeddings,
+    fake_llm,
+    make_turn,
+    route_reply,
+)
 
 
 def test_generate_sql_increments_attempts_and_clears_error() -> None:
@@ -24,7 +32,6 @@ def test_generate_sql_increments_attempts_and_clears_error() -> None:
     assert update == {
         "reasoning": "Use employees.",
         "sql": "SELECT emp_name FROM employees",
-        "no_sql": False,
         "error": None,
         "result": None,
         "attempts": 2,
@@ -32,23 +39,35 @@ def test_generate_sql_increments_attempts_and_clears_error() -> None:
     }
 
 
-def test_generate_sql_no_sql_reply_sets_the_flag_without_sql() -> None:
-    reply = AIMessage(content="NO_SQL", additional_kwargs={"reasoning_content": "A greeting."})
-    update = nodes.generate_sql(
-        {"question": "hello, who are you?", "context": [TABLE_DOC]},
-        llm=fake_llm(reply),
-        row_limit=10,
-    )
-    assert (update["sql"], update["no_sql"], update["attempts"]) == (None, True, 1)
-    assert update["reasoning"] == "A greeting."
-
-
-def test_answer_to_no_sql_replies_without_a_result() -> None:
+def test_answer_to_chat_replies_without_a_result() -> None:
     llm = fake_llm("Hi! I answer questions about the employees table.")
-    state = {"question": "hello, who are you?", "no_sql": True, "context": [TABLE_DOC]}
+    state = {
+        "question": "hello, who are you?",
+        "intent": "chat",
+        "no_sql": True,
+        "context": [TABLE_DOC],
+    }
     assert nodes.answer(state, llm=llm) == {
         "answer": "Hi! I answer questions about the employees table.",
         "answer_reasoning": None,
+        "llm_usage": None,
+    }
+
+
+def test_answer_to_a_vague_question_asks_back() -> None:
+    llm = fake_llm(
+        AIMessage(content="Best by salary?", additional_kwargs={"reasoning_content": "r"})
+    )
+    state = {
+        "question": "best employees",
+        "intent": "clarify",
+        "unclear": "No measure.",
+        "no_sql": True,
+        "context": [TABLE_DOC],
+    }
+    assert nodes.answer(state, llm=llm) == {
+        "answer": "Best by salary?",
+        "answer_reasoning": "r",
         "llm_usage": None,
     }
 
@@ -160,18 +179,58 @@ def test_load_history_disabled(chat_store) -> None:
     assert nodes.load_history({"thread_id": "t1"}, store=chat_store, max_turns=0) == {"history": []}
 
 
-def test_condense_question_skips_llm_without_history() -> None:
-    update = nodes.condense_question({"question": "q", "history": []}, llm=fake_llm())
-    assert update == {"standalone_question": "q"}
-
-
-def test_condense_question_rewrites_follow_up() -> None:
-    llm = fake_llm(AIMessage(content="<think>resolve it</think>\nLowest paid in Sales?"))
-    state = {"question": "And the lowest?", "history": [make_turn("Highest paid in Sales?")]}
-    assert nodes.condense_question(state, llm=llm) == {
-        "standalone_question": "Lowest paid in Sales?",
+def test_route_question_data_without_history() -> None:
+    update = nodes.route_question({"question": "q", "history": []}, llm=fake_llm(route_reply()))
+    assert update == {
+        "intent": "data",
+        "standalone_question": "q",
+        "unclear": None,
+        "no_sql": False,
         "llm_usage": None,
     }
+
+
+def test_route_question_rewrites_follow_up() -> None:
+    reply = "<think>resolve it</think>\n" + route_reply(standalone="Lowest paid in Sales?")
+    state = {"question": "And the lowest?", "history": [make_turn("Highest paid in Sales?")]}
+    update = nodes.route_question(state, llm=fake_llm(AIMessage(content=reply)))
+    assert (update["intent"], update["standalone_question"]) == ("data", "Lowest paid in Sales?")
+
+
+def test_route_question_chat_keeps_the_message_and_runs_no_sql() -> None:
+    update = nodes.route_question(
+        {"question": "hello!"}, llm=fake_llm(route_reply("chat", standalone="Greeting"))
+    )
+    assert (update["intent"], update["standalone_question"], update["no_sql"]) == (
+        "chat",
+        "hello!",
+        True,
+    )
+
+
+def test_route_question_clarify_keeps_what_is_unclear() -> None:
+    reply = route_reply("clarify", unclear=" No measure. ")
+    update = nodes.route_question({"question": "best products"}, llm=fake_llm(reply))
+    assert (update["intent"], update["unclear"], update["no_sql"]) == (
+        "clarify",
+        "No measure.",
+        True,
+    )
+
+
+def test_route_question_reads_json_in_a_code_block() -> None:
+    reply = "```json\n" + route_reply("chat") + "\n```"
+    assert nodes.route_question({"question": "hi"}, llm=fake_llm(reply))["intent"] == "chat"
+
+
+@pytest.mark.parametrize("reply", ["", "not json", '{"intent": "poem"}', "[1, 2]"])
+def test_route_question_falls_back_to_a_data_question(reply: str) -> None:
+    update = nodes.route_question({"question": "How many?"}, llm=fake_llm(reply))
+    assert (update["intent"], update["standalone_question"], update["no_sql"]) == (
+        "data",
+        "How many?",
+        False,
+    )
 
 
 def test_save_turn_appends_and_saves(chat_store) -> None:

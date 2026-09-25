@@ -10,7 +10,7 @@ from rag_sql.ui.steps import Step
 from rag_sql.ui.web import model_label
 from rag_sql.ui.web_chat import INTERRUPTED, run_turn
 from rag_sql.ui.web_examples import filter_examples
-from tests.conftest import KeywordEmbeddings, fake_llm, make_turn
+from tests.conftest import ROUTE_DATA, KeywordEmbeddings, fake_llm, make_turn
 
 SQL_REPLY = AIMessage(
     content="```sql\nSELECT emp_name, salary FROM employees\n```",
@@ -28,7 +28,7 @@ def test_model_label() -> None:
 
 def _fake_graph(settings, retriever, ok_runner, stores, *replies):
     return build_graph(
-        llm=fake_llm(*replies),
+        llm=fake_llm(ROUTE_DATA, *replies),
         retriever=retriever,
         query_runner=ok_runner,
         **stores,
@@ -50,7 +50,11 @@ def test_messages_mode_streams_thinking_per_node(settings, retriever, ok_runner,
             reasoning[node] = reasoning.get(node, "") + (
                 message.additional_kwargs.get("reasoning_content") or ""
             )
-    assert reasoning == {"generate_sql": "Order employees by salary.", "answer": "One row."}
+    assert reasoning == {
+        "route_question": "",  # the router doesn't think
+        "generate_sql": "Order employees by salary.",
+        "answer": "One row.",
+    }
 
 
 class ScriptedGraph:
@@ -77,7 +81,7 @@ def _thinking_token(node: str, text: str) -> tuple:
 
 def test_interrupted_run_is_saved_with_what_it_streamed() -> None:
     items = [
-        ("updates", {"condense_question": {"standalone_question": "Who earns the most money?"}}),
+        ("updates", {"route_question": {"standalone_question": "Who earns the most money?"}}),
         _thinking_token("generate_sql", "Sort by salary."),
     ]
     saved, steps = [], []
@@ -186,7 +190,10 @@ def test_app_runs_a_turn_and_lists_the_thread(
     settings, retriever, ok_runner, stores, chat_store
 ) -> None:
     graph = build_graph(
-        llm=NamedFakeChatModel(messages=iter([SQL_REPLY, ANSWER_REPLY]), model="gemma4:e4b"),
+        llm=NamedFakeChatModel(
+            messages=iter([AIMessage(content=ROUTE_DATA), SQL_REPLY, ANSWER_REPLY]),
+            model="gemma4:e4b",
+        ),
         retriever=retriever,
         query_runner=ok_runner,
         **stores,

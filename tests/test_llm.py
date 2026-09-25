@@ -9,7 +9,9 @@ from rag_sql.llm import (
     chat_model_name,
     get_chat_model,
     get_embeddings,
+    get_router_model,
     list_chat_models,
+    with_json_schema,
 )
 
 # What the Ollama server reported (0.34.3) for the models on the dev machine, plus two odd cases.
@@ -81,3 +83,23 @@ def test_embeddings_are_shared_per_model() -> None:
     s = Settings(_env_file=None)
     assert get_embeddings(s) is get_embeddings(Settings(_env_file=None))
     assert get_embeddings(s) is not get_embeddings(s, model="other-embed")
+
+
+def test_router_model_is_the_chat_model_without_thinking() -> None:
+    s = Settings(_env_file=None)
+    chat = get_chat_model(s, reasoning=True)
+    router = get_router_model(chat, s)
+    assert router.bound is chat  # same model: nothing else to load on the server
+    assert router.kwargs == {"reasoning": False}
+
+
+def test_router_model_can_be_another_model() -> None:
+    s = Settings(_env_file=None, ollama_router_model="qwen3:4b", ollama_chat_model="qwen3:14b")
+    router = get_router_model(get_chat_model(s), s)
+    assert (router.model, router.reasoning) == ("qwen3:4b", False)
+
+
+def test_with_json_schema_asks_the_model_for_that_schema() -> None:
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+    bound = with_json_schema(get_chat_model(Settings(_env_file=None)), schema)
+    assert bound.kwargs == {"format": schema}

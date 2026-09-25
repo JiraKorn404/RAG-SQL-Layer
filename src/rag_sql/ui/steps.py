@@ -27,8 +27,17 @@ StepKind = Literal[
 ]
 
 
-# Shown instead of the SQL when the model found the question isn't about the data.
+# Shown instead of the SQL when the router found the message isn't about the data.
 NO_SQL_NOTE = "No SQL: not a question about the data."
+# Saved turns don't record why there is no SQL: a chat message or a question that needed
+# clarifying.
+NO_SQL_SAVED_NOTE = "No SQL for this reply."
+
+
+def clarify_note(unclear: str | None) -> str:
+    """Shown instead of the SQL when the router found the question too vague."""
+    note = "No SQL yet: the question is too vague."
+    return f"{note} {unclear}" if unclear else note
 
 
 @dataclass
@@ -88,11 +97,16 @@ def steps_from_update(
     if node == "load_history":
         earlier = len(update.get("history") or [])
         return [Step("caption", f"{earlier} earlier question(s) in context")] if earlier else []
-    if node == "condense_question":
+    if node == "route_question":
+        steps = []
         standalone = update.get("standalone_question") or ""
         if standalone.strip() != question.strip():
-            return [Step("interpreted", standalone)]
-        return []
+            steps.append(Step("interpreted", standalone))
+        if update.get("intent") == "clarify":
+            steps.append(Step("caption", clarify_note(update.get("unclear"))))
+        elif update.get("no_sql"):
+            steps.append(Step("caption", NO_SQL_NOTE))
+        return steps
     if node == "retrieve_context":
         docs = update.get("context") or []
         tables = [d.metadata.get("table") for d in docs if d.metadata.get("kind") == "table"]
@@ -112,8 +126,6 @@ def steps_from_update(
         steps = []
         if reasoning := update.get("reasoning"):
             steps.append(Step("thinking", reasoning, label=thinking_label(node, attempt)))
-        if update.get("no_sql"):
-            return [*steps, Step("caption", NO_SQL_NOTE)]
         label = "SQL" if attempt <= 1 else f"SQL (attempt {attempt})"
         return [*steps, Step("sql", update.get("sql") or "", label=label)]
     if node in ("validate_sql", "execute_sql") and update.get("error"):
@@ -168,8 +180,8 @@ def steps_from_turn(turn: Turn) -> list[Step]:
     if turn["sql"]:
         steps.append(Step("sql", turn["sql"], label="SQL"))
     elif not turn["error"] and turn["answer"]:
-        # Answered without SQL and without an error: the model replied NO_SQL.
-        steps.append(Step("caption", NO_SQL_NOTE))
+        # Answered without SQL and without an error: a chat message, or a clarifying question.
+        steps.append(Step("caption", NO_SQL_SAVED_NOTE))
     if turn["row_count"] is not None:
         steps.append(Step("caption", f"{turn['row_count']} row(s) · result rows aren't saved"))
     if turn["error"]:

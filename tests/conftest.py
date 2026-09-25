@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 
 import pytest
@@ -29,6 +30,14 @@ EXAMPLE_DOC = Document(
 def fake_llm(*replies: str | AIMessage) -> GenericFakeChatModel:
     messages = [r if isinstance(r, AIMessage) else AIMessage(content=r) for r in replies]
     return GenericFakeChatModel(messages=iter(messages))
+
+
+def route_reply(intent: str = "data", standalone: str = "", unclear: str = "") -> str:
+    """The router's JSON reply. An empty standalone question means: the question as asked."""
+    return json.dumps({"intent": intent, "standalone_question": standalone, "unclear": unclear})
+
+
+ROUTE_DATA = route_reply()  # the first reply of a run with a question about the data
 
 
 @pytest.fixture(autouse=True)

@@ -30,3 +30,17 @@ def test_help_needs_no_database(main, capsys) -> None:
         main(["--help"])
     assert exit_info.value.code == 0
     assert "usage:" in capsys.readouterr().out
+
+
+def test_eval_run_passes_its_options(monkeypatch, capsys) -> None:
+    seen: dict = {}
+
+    def fake_evaluate(models, **kwargs) -> str:
+        seen.update(models=models, **kwargs)
+        return "report"
+
+    monkeypatch.setattr(cli, "evaluate", fake_evaluate)
+    cli.eval_main(["run", "--models", "gemma4:e4b", "--router-only", "--repeat", "3"])
+
+    assert (seen["models"], seen["router_only"], seen["repeat"]) == (["gemma4:e4b"], True, 3)
+    assert capsys.readouterr().out.strip() == "report"

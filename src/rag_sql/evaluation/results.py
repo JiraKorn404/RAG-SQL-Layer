@@ -12,8 +12,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rag_sql.agent.prompts import prompt_version
 from rag_sql.config import PROJECT_ROOT, Settings
-from rag_sql.evaluation.scoring import CORRECT, Outcome
+from rag_sql.evaluation.scoring import CORRECT, EXPECTED_INTENT, Outcome
 from rag_sql.metrics import TurnMetrics
 
 DEFAULT_OUT_DIR = PROJECT_ROOT / "evaluation" / "results"
@@ -31,10 +32,20 @@ class CaseResult:
     attempts: int
     seconds: float  # whole run, including saving
     metrics: TurnMetrics | None  # up to the answer, as the chat history records it
+    expected: str = "sql"  # the kind of case: sql, chat or clarify
+    intent: str | None = None  # what the router chose (None for runs before the router)
+    standalone: str | None = None  # the question as the router rewrote it
 
     @property
     def correct(self) -> bool:
         return self.outcome in CORRECT
+
+    @property
+    def routed_right(self) -> bool | None:
+        """Whether the router chose the intent the case expects; None when it recorded none."""
+        if self.intent is None:
+            return None
+        return self.intent == EXPECTED_INTENT[self.expected]
 
 
 def _percentile(values: list[float], p: float) -> float:
@@ -49,11 +60,17 @@ def summarize_results(results: list[CaseResult]) -> dict[str, Any]:
     seconds = [(r.metrics["total_ms"] / 1000) if r.metrics else r.seconds for r in results]
     tokens = [r.metrics["input_tokens"] + r.metrics["output_tokens"] for r in results if r.metrics]
     by_tag: dict[str, list[int]] = {}
+    by_kind: dict[str, list[int]] = {}
     for r in results:
-        for tag in r.tags:
-            counts = by_tag.setdefault(tag, [0, 0])
+        for counts in [by_tag.setdefault(tag, [0, 0]) for tag in r.tags] + [
+            by_kind.setdefault(r.expected, [0, 0])
+        ]:
             counts[0] += r.correct
             counts[1] += 1
+    routed = [r.routed_right for r in results if r.routed_right is not None]
+    runs_by_case: dict[str, set[bool]] = {}
+    for r in results:
+        runs_by_case.setdefault(r.case_id, set()).add(r.correct)
     n = len(results)
     return {
         "runs": n,
@@ -66,24 +83,45 @@ def summarize_results(results: list[CaseResult]) -> dict[str, Any]:
         "avg_tokens": sum(tokens) / len(tokens) if tokens else None,
         "outcomes": dict(Counter(r.outcome for r in results)),
         "by_tag": {tag: {"correct": c, "runs": t} for tag, (c, t) in sorted(by_tag.items())},
+        "by_kind": {kind: {"correct": c, "runs": t} for kind, (c, t) in sorted(by_kind.items())},
+        "route": {"right": sum(routed), "runs": len(routed)},
+        # Cases that passed in some runs and failed in others (with --repeat).
+        "flaky": sum(len(outcomes) > 1 for outcomes in runs_by_case.values()),
     }
 
 
-def format_report(model: str, results: list[CaseResult]) -> str:
+def format_report(model: str, results: list[CaseResult], *, router_only: bool = False) -> str:
     s = summarize_results(results)
     tokens = f"{s['avg_tokens'] / 1000:.1f}k" if s["avg_tokens"] is not None else "n/a"
-    lines = [
-        f"Model {model}: {s['correct']}/{s['runs']} correct ({s['accuracy']:.0%}), "
-        f"{s['exact']} exact, {s['avg_attempts']:.2f} attempts, "
-        f"p50 {s['p50_s']:.1f} s, p95 {s['p95_s']:.1f} s, {tokens} tokens/turn",
+    if router_only:
+        # Only the router ran: "correct" means it chose the right intent.
+        lines = [
+            f"Router of {model}: {s['correct']}/{s['runs']} right intent ({s['accuracy']:.0%}), "
+            f"p50 {s['p50_s']:.1f} s, p95 {s['p95_s']:.1f} s"
+        ]
+    else:
+        lines = [
+            f"Model {model}: {s['correct']}/{s['runs']} correct ({s['accuracy']:.0%}), "
+            f"{s['exact']} exact, {s['avg_attempts']:.2f} attempts, "
+            f"p50 {s['p50_s']:.1f} s, p95 {s['p95_s']:.1f} s, {tokens} tokens/turn"
+        ]
+        if s["route"]["runs"]:
+            lines.append(f"  router: {s['route']['right']}/{s['route']['runs']} right intent")
+    lines += [
+        "  by kind: "
+        + ", ".join(f"{kind} {v['correct']}/{v['runs']}" for kind, v in s["by_kind"].items()),
         "  by tag: "
         + ", ".join(f"{tag} {v['correct']}/{v['runs']}" for tag, v in s["by_tag"].items()),
     ]
+    if s["flaky"]:
+        lines.append(f"  flaky: {s['flaky']} case(s) passed in some runs and failed in others")
     for r in results:
         mark = "ok  " if r.correct else "FAIL"
         run = f" #{r.run}" if s["runs"] > len({x.case_id for x in results}) else ""
         detail = f" ({r.error})" if r.outcome in ("sql_failed", "agent_error") and r.error else ""
         lines.append(f"  {mark} {r.case_id}{run}: {r.outcome}{detail}")
+        if not r.correct and router_only and r.intent:
+            lines.append(f"       chose {r.intent}, expected {EXPECTED_INTENT[r.expected]}")
     return "\n".join(lines)
 
 
@@ -106,6 +144,7 @@ def write_results(
     cases_path: Path,
     with_history: bool,
     repeat: int,
+    router_only: bool = False,
 ) -> Path:
     """One JSON file per model and run, named by time and model."""
     created = datetime.now()
@@ -118,7 +157,10 @@ def write_results(
         "cases_file": str(cases_path),
         "repeat": repeat,
         "with_history": with_history,
+        "router_only": router_only,
+        "prompt_version": prompt_version(),
         "settings": {
+            "ollama_router_model": settings.ollama_router_model or None,
             "ollama_embed_model": settings.ollama_embed_model,
             "ollama_reasoning": settings.ollama_reasoning,
             "retrieval_k": settings.retrieval_k,
@@ -160,9 +202,12 @@ def compare_runs(old: dict[str, Any], new: dict[str, Any]) -> str:
 
     def label(payload: dict[str, Any]) -> str:
         s = payload["summary"]
+        route = s.get("route") or {}
+        routed = f", router {route['right']}/{route['runs']}" if route.get("runs") else ""
         return (
-            f"{payload['model']} @ {payload.get('git_commit') or '?'}: "
-            f"{s['correct']}/{s['runs']} ({s['accuracy']:.0%})"
+            f"{payload['model']} @ {payload.get('git_commit') or '?'}"
+            f" prompts {payload.get('prompt_version') or '?'}: "
+            f"{s['correct']}/{s['runs']} ({s['accuracy']:.0%}){routed}"
         )
 
     before, after = by_case(old), by_case(new)

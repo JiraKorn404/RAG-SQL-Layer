@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 
 from rag_sql.db.query import QueryResult
-from rag_sql.evaluation.scoring import compare, is_ordered, normalize, same_value
+from rag_sql.evaluation.scoring import compare, is_ordered, normalize, route_outcome, same_value
 
 
 def _result(columns: str, *rows: tuple) -> QueryResult:
@@ -120,3 +120,21 @@ def test_near_equal_numbers_pair_up_across_rows() -> None:
     expected = _result("dept avg", ("a", Decimal("10.004")), ("b", Decimal("10.001")))
     actual = _result("dept avg", ("b", 10.0), ("a", 10.0))
     assert compare(expected, actual, ordered=False) == "correct"
+
+
+@pytest.mark.parametrize(
+    ("kind", "intent", "outcome"),
+    [
+        ("sql", "data", "correct"),
+        ("sql", "chat", "declined"),
+        ("sql", "clarify", "unneeded_clarify"),
+        ("chat", "chat", "correct"),
+        ("chat", "data", "unneeded_sql"),
+        ("chat", "clarify", "unneeded_clarify"),
+        ("clarify", "clarify", "correct"),
+        ("clarify", "data", "guessed"),
+        ("clarify", "chat", "declined"),
+    ],
+)
+def test_route_outcome(kind: str, intent: str, outcome: str) -> None:
+    assert route_outcome(kind, intent) == outcome

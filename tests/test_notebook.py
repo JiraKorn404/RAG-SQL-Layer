@@ -4,7 +4,7 @@ import pytest
 
 from rag_sql.agent.graph import build_graph
 from rag_sql.ui import notebook
-from tests.conftest import fake_llm
+from tests.conftest import ROUTE_DATA, fake_llm
 
 
 @pytest.fixture
@@ -23,7 +23,9 @@ def test_run_and_display_renders_each_step(
     shown, settings, retriever, ok_runner, stores, chat_store
 ) -> None:
     graph = build_graph(
-        llm=fake_llm("```sql\nSELECT emp_name, salary FROM employees\n```", "Costs $5 and $6."),
+        llm=fake_llm(
+            ROUTE_DATA, "```sql\nSELECT emp_name, salary FROM employees\n```", "Costs $5 and $6."
+        ),
         retriever=retriever,
         query_runner=ok_runner,
         **stores,

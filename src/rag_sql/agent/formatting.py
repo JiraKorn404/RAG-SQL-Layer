@@ -1,16 +1,19 @@
-"""Prompt inputs from the agent state, and parsing of the model's replies (thinking, SQL,
-NO_SQL)."""
+"""Prompt inputs from the agent state, and parsing of the model's replies (thinking, SQL, the
+router's decision)."""
 
+import logging
 import re
 from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
 
-from rag_sql.agent.prompts import NO_SQL
+from rag_sql.agent.schemas import RouteDecision
 from rag_sql.db.query import QueryResult
 from rag_sql.history.chat import Turn
 from rag_sql.history.queries import PastQuery
+
+logger = logging.getLogger(__name__)
 
 # Rows of the SQL result shown to the model when writing the answer.
 ANSWER_MAX_ROWS = 50
@@ -21,6 +24,7 @@ HISTORY_ANSWER_CHARS = 500
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 _SQL_BLOCK_RE = re.compile(r"```sql\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _ANY_BLOCK_RE = re.compile(r"```\w*\s*(.*?)```", re.DOTALL)
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def split_reasoning(message: BaseMessage) -> tuple[str | None, str]:
@@ -47,10 +51,19 @@ def extract_sql(content: str) -> str:
     return content.strip()
 
 
-def is_no_sql(content: str) -> bool:
-    """Whether the SQL model replied NO_SQL (not a question about the data), allowing for a code
-    block, quotes or a trailing period around it."""
-    return extract_sql(content).strip(" \t\r\n`'\".").upper() == NO_SQL
+def parse_route(content: str, question: str) -> RouteDecision:
+    """The router's decision from its reply: JSON, possibly inside a code block or after some text.
+
+    A reply that isn't a valid decision falls back to a plain data question, so the run goes on as
+    if there were no router.
+    """
+    for candidate in (content, *_JSON_OBJECT_RE.findall(content)):
+        try:
+            return RouteDecision.model_validate_json(candidate)
+        except ValueError:  # includes pydantic's ValidationError
+            continue
+    logger.warning("Router reply is not a valid decision; treating it as a data question")
+    return RouteDecision(intent="data", standalone_question=question)
 
 
 def format_schema(context: list[Document]) -> str:
@@ -105,7 +118,7 @@ def format_history(history: list[Turn], *, sql: bool = False, answers: bool = Tr
             elif turn["error"]:
                 lines.append(f"(no working SQL; error: {turn['error']})")
             else:
-                lines.append("(no SQL: not a question about the data)")
+                lines.append("(no SQL was written for this message)")
         if answers:
             text = turn["answer"]
             if len(text) > HISTORY_ANSWER_CHARS:

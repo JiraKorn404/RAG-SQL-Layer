@@ -5,6 +5,7 @@ from typing import Annotated, TypedDict
 
 from langchain_core.documents import Document
 
+from rag_sql.agent.schemas import Intent
 from rag_sql.db.query import QueryResult
 from rag_sql.history.chat import Turn
 from rag_sql.history.queries import PastQuery
@@ -15,12 +16,14 @@ class AgentState(TypedDict, total=False):
     thread_id: str | None  # conversation id; nothing is saved without one
     history: list[Turn]  # earlier turns of the conversation, oldest first (+ this one at the end)
     question: str
+    intent: Intent  # the router's decision: data (write SQL), chat or clarify (no SQL)
     standalone_question: str  # question rewritten to stand on its own; == question on turn 1
+    unclear: str | None  # for intent "clarify": what is missing or ambiguous in the question
     context: list[Document]  # retrieved table docs + few-shot example docs
     similar_queries: list[PastQuery]  # similar past queries users marked as good, best first
     reasoning: str | None  # model thinking behind the latest SQL, if the model produced any
     sql: str | None  # latest SQL (normalized by validate_sql once it passes)
-    no_sql: bool  # the model replied NO_SQL: not a question about the data, so nothing runs
+    no_sql: bool  # the router found no SQL to write (chat or clarify), so nothing runs
     error: str | None  # validation or execution error of the latest SQL
     db_unavailable: bool  # the database couldn't be used (not a SQL problem), so no retry
     attempts: int  # number of SQL generations so far

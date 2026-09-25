@@ -19,7 +19,7 @@ from rag_sql.ui.steps import Step, escape_md, steps_from_update, thinking_label
 
 logger = logging.getLogger(__name__)
 
-# Nodes whose model calls are streamed token by token. condense_question is short and not shown.
+# Nodes whose model calls are streamed token by token. route_question is short and not shown.
 STREAMED_NODES = ("generate_sql", "answer")
 
 # Seconds between redraws of streamed text; redrawing on every token slows the page down.

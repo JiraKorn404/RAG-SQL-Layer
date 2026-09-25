@@ -4,6 +4,7 @@ from rag_sql.db.query import QueryResult
 from rag_sql.metrics import node_metric, summarize
 from rag_sql.ui.steps import (
     NO_SQL_NOTE,
+    NO_SQL_SAVED_NOTE,
     ExampleCandidate,
     escape_md,
     example_candidate,
@@ -17,10 +18,33 @@ def _steps(node: str, update: dict, question: str = "Q?", attempts: int = 1) -> 
     return steps_from_update(node, update, question=question, attempts=attempts, max_retries=2)
 
 
-def test_condensed_question_shown_only_when_rewritten() -> None:
-    assert _steps("condense_question", {"standalone_question": "Q?"}) == []
-    [step] = _steps("condense_question", {"standalone_question": "Q about sales?"})
+def test_rewritten_question_shown_only_when_it_differs() -> None:
+    same = {"intent": "data", "standalone_question": "Q?", "no_sql": False}
+    assert _steps("route_question", same) == []
+    rewritten = {"intent": "data", "standalone_question": "Q about sales?", "no_sql": False}
+    [step] = _steps("route_question", rewritten)
     assert (step.kind, step.text) == ("interpreted", "Q about sales?")
+
+
+def test_chat_message_shows_a_note() -> None:
+    update = {"intent": "chat", "standalone_question": "Q?", "no_sql": True}
+    assert [(s.kind, s.text) for s in _steps("route_question", update)] == [
+        ("caption", NO_SQL_NOTE)
+    ]
+
+
+def test_vague_question_shows_what_is_unclear() -> None:
+    update = {
+        "intent": "clarify",
+        "standalone_question": "Best products?",
+        "unclear": "No measure.",
+        "no_sql": True,
+    }
+    steps = _steps("route_question", update, question="best?")
+    assert [(s.kind, s.text) for s in steps] == [
+        ("interpreted", "Best products?"),
+        ("caption", "No SQL yet: the question is too vague. No measure."),
+    ]
 
 
 def test_history_caption_only_with_earlier_turns() -> None:
@@ -48,20 +72,11 @@ def test_retry_generation_is_labelled_with_attempt() -> None:
     ]
 
 
-def test_no_sql_generation_shows_a_note_instead_of_sql() -> None:
-    update = {"sql": None, "no_sql": True, "reasoning": "A greeting.", "attempts": 1}
-    steps = _steps("generate_sql", update)
-    assert [(s.kind, s.text) for s in steps] == [
-        ("thinking", "A greeting."),
-        ("caption", NO_SQL_NOTE),
-    ]
-
-
 def test_saved_no_sql_turn_shows_the_note() -> None:
     turn = make_turn("hello?", sql=None, answer="Hi!")
-    turn["error"] = None  # answered without SQL and without an error: a NO_SQL reply
+    turn["error"] = None  # answered without SQL and without an error: chat, or a question back
     steps = steps_from_turn(turn)
-    assert [(s.kind, s.text) for s in steps] == [("caption", NO_SQL_NOTE), ("answer", "Hi!")]
+    assert [(s.kind, s.text) for s in steps] == [("caption", NO_SQL_SAVED_NOTE), ("answer", "Hi!")]
 
 
 @pytest.mark.parametrize(
@@ -108,7 +123,7 @@ def test_example_candidate_is_the_standalone_question_and_sql() -> None:
         {"sql": None, "row_count": None, "error": "boom"},  # every attempt failed
         {"row_count": 0},  # no rows
         {"error": "Interrupted"},  # the run didn't finish
-        {"sql": None, "row_count": None},  # NO_SQL: not a question about the data
+        {"sql": None, "row_count": None},  # no SQL: not a question about the data
     ],
 )
 def test_no_example_candidate_without_rows(overrides) -> None:

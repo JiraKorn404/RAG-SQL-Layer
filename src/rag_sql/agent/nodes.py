@@ -22,14 +22,15 @@ from rag_sql.agent.formatting import (
     format_schema,
     format_similar_queries,
     format_table_names,
-    is_no_sql,
+    parse_route,
     split_reasoning,
 )
 from rag_sql.agent.prompts import (
     ANSWER_HISTORY,
     ANSWER_PROMPT,
     CHAT_REPLY_PROMPT,
-    CONDENSE_PROMPT,
+    CLARIFY_PROMPT,
+    ROUTER_PROMPT,
     SIMILAR_QUERIES,
     SQL_GENERATION_PROMPT,
     SQL_HISTORY,
@@ -63,18 +64,29 @@ def load_history(state: AgentState, *, store: ChatStore, max_turns: int) -> dict
     return {"history": state.get("history", [])[-max_turns:]}
 
 
-def condense_question(state: AgentState, *, llm: BaseChatModel) -> dict:
-    """Rewrite a follow-up into a standalone question. No model call on the first turn."""
+def route_question(state: AgentState, *, llm: Runnable) -> dict:
+    """The router agent: decide what the message is (data question, chat, or too vague), and
+    rewrite a follow-up into a standalone question.
+
+    `llm` replies in JSON (see `schemas.RouteDecision`). When it doesn't, the message is treated
+    as a data question, as it was before there was a router.
+    """
     question = state["question"]
     history = state.get("history") or []
-    if not history:
-        return {"standalone_question": question}
-
-    message = (CONDENSE_PROMPT | llm).invoke(
-        {"history": format_history(history), "question": question}
+    message = (ROUTER_PROMPT | llm).invoke(
+        {"history": format_history(history) or "(none)", "question": question}
     )
     _, content = split_reasoning(message)
-    return {"standalone_question": content or question, "llm_usage": usage_of(message)}
+    decision = parse_route(content, question)
+    # A chat message is copied as it is: there is nothing to make standalone.
+    standalone = question if decision.intent == "chat" else decision.standalone_question
+    return {
+        "intent": decision.intent,
+        "standalone_question": standalone.strip() or question,
+        "unclear": (decision.unclear.strip() or None) if decision.intent == "clarify" else None,
+        "no_sql": decision.intent != "data",
+        "llm_usage": usage_of(message),
+    }
 
 
 def retrieve_context(state: AgentState, *, retriever: Runnable[str, list[Document]]) -> dict:
@@ -105,7 +117,7 @@ def find_similar_queries(
 
 
 def generate_sql(state: AgentState, *, llm: BaseChatModel, row_limit: int) -> dict:
-    """Write SQL for the question, or set `no_sql` (and no SQL) when the model replied NO_SQL."""
+    """Write SQL for the question."""
     feedback = ""
     if state.get("error") and state.get("sql") is not None:
         feedback = SQL_RETRY_FEEDBACK.format(sql=state["sql"], error=state["error"])
@@ -131,11 +143,9 @@ def generate_sql(state: AgentState, *, llm: BaseChatModel, row_limit: int) -> di
         }
     )
     reasoning, content = split_reasoning(message)
-    no_sql = is_no_sql(content)
     return {
         "reasoning": reasoning,
-        "sql": None if no_sql else extract_sql(content),
-        "no_sql": no_sql,
+        "sql": extract_sql(content),
         "error": None,
         "result": None,
         "attempts": state.get("attempts", 0) + 1,
@@ -171,6 +181,8 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
             "answer_reasoning": None,
         }
     if state.get("no_sql"):
+        if state.get("intent") == "clarify":
+            return clarify_reply(state, llm=llm)
         return chat_reply(state, llm=llm)
     if result is None:
         # Retries exhausted: report the failure without another model call.
@@ -206,7 +218,8 @@ def answer(state: AgentState, *, llm: BaseChatModel) -> dict:
 def chat_reply(state: AgentState, *, llm: BaseChatModel) -> dict:
     """The answer to a message that isn't about the data: no SQL ran, so no result to report.
 
-    Part of the answer node (its update and streamed tokens are the answer's), not a node itself.
+    Part of the answer node (its update and streamed tokens are the answer's), not a node itself,
+    like `clarify_reply`.
     """
     history = state.get("history") or []
     message = (CHAT_REPLY_PROMPT | llm).invoke(
@@ -214,6 +227,23 @@ def chat_reply(state: AgentState, *, llm: BaseChatModel) -> dict:
             "tables": format_table_names(state.get("context", [])),
             "history": ANSWER_HISTORY.format(turns=format_history(history)) if history else "",
             "question": state["question"],
+        }
+    )
+    reasoning, content = split_reasoning(message)
+    return {"answer": content, "answer_reasoning": reasoning, "llm_usage": usage_of(message)}
+
+
+def clarify_reply(state: AgentState, *, llm: BaseChatModel) -> dict:
+    """The answer to a question too vague for one query: a question back, offering options that
+    exist in the retrieved schema. It is saved as the turn's answer, so the user's reply to it
+    arrives as a follow-up that the router combines with this question."""
+    history = state.get("history") or []
+    message = (CLARIFY_PROMPT | llm).invoke(
+        {
+            "schema": format_schema(state.get("context", [])),
+            "history": ANSWER_HISTORY.format(turns=format_history(history)) if history else "",
+            "question": current_question(state),
+            "unclear": state.get("unclear") or "(not stated)",
         }
     )
     reasoning, content = split_reasoning(message)

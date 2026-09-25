@@ -16,11 +16,26 @@ def test_extract_sql_falls_back_to_any_block_then_raw() -> None:
     assert formatting.extract_sql("  SELECT 4  ") == "SELECT 4"
 
 
-def test_is_no_sql() -> None:
-    for reply in ("NO_SQL", " no_sql.\n", "`NO_SQL`", '"NO_SQL"', "```sql\nNO_SQL\n```"):
-        assert formatting.is_no_sql(reply), reply
-    for reply in ("SELECT 1", "```sql\nSELECT 'NO_SQL'\n```", "NO_SQL because it's a greeting"):
-        assert not formatting.is_no_sql(reply), reply
+def test_parse_route_reads_the_decision() -> None:
+    reply = '{"intent": "clarify", "standalone_question": "Best?", "unclear": "No measure."}'
+    decision = formatting.parse_route(reply, "best")
+    assert (decision.intent, decision.standalone_question, decision.unclear) == (
+        "clarify",
+        "Best?",
+        "No measure.",
+    )
+
+
+def test_parse_route_finds_json_around_other_text() -> None:
+    reply = 'Sure:\n```json\n{"intent": "chat", "standalone_question": "hi"}\n```'
+    decision = formatting.parse_route(reply, "hi")
+    assert (decision.intent, decision.unclear) == ("chat", "")
+
+
+def test_parse_route_falls_back_to_a_data_question() -> None:
+    for reply in ("", "SELECT 1", '{"intent": "unknown"}', '{"standalone_question": "x"}'):
+        decision = formatting.parse_route(reply, "How many?")
+        assert (decision.intent, decision.standalone_question) == ("data", "How many?"), reply
 
 
 def test_format_table_names() -> None:
@@ -68,9 +83,9 @@ def test_format_history_sql_and_answers() -> None:
 
 def test_format_history_no_sql_turn() -> None:
     turn = make_turn("hello?", sql=None, answer="Hi!")
-    turn["error"] = None  # a NO_SQL reply
+    turn["error"] = None  # a chat message, or a question that was asked back
     text = formatting.format_history([turn], sql=True, answers=False)
-    assert text == "Question: hello?\n(no SQL: not a question about the data)"
+    assert text == "Question: hello?\n(no SQL was written for this message)"
 
 
 def test_format_history_truncates_long_answers() -> None:

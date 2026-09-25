@@ -8,6 +8,7 @@ from typing import Any
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
+from langchain_core.runnables import Runnable
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from ollama import Client
 
@@ -42,6 +43,23 @@ def get_chat_model(settings: Settings | None = None, **overrides: Any) -> BaseCh
     }
     params.update(overrides)
     return ChatOllama(**params)
+
+
+def get_router_model(chat_llm: BaseChatModel, settings: Settings | None = None) -> Runnable:
+    """Model of the router agent: a short classification, so it never thinks.
+
+    `OLLAMA_ROUTER_MODEL` when set, else the chat model itself with thinking off (same model, so
+    Ollama doesn't have to load a second one).
+    """
+    s = settings or get_settings()
+    if s.ollama_router_model:
+        return get_chat_model(s, model=s.ollama_router_model, reasoning=False)
+    return chat_llm.bind(reasoning=False)
+
+
+def with_json_schema(llm: Runnable, schema: dict[str, Any]) -> Runnable:
+    """The model constrained to reply with JSON that fits `schema` (Ollama's `format`)."""
+    return llm.bind(format=schema)
 
 
 class CachedEmbeddings(Embeddings):

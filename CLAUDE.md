@@ -44,18 +44,19 @@ RAG-SQL-Layer/
 ├── .env.example                # all config keys, no secrets
 ├── .github/workflows/ci.yml    # CI: ruff check + format, nbstripout --verify, pytest
 ├── db/init/                    # run in filename order on first container start: 01-extensions,
-│                               #   02-roles (read-only role), 03-employees, 04-chat-memory
-│                               #   (chat_memory tables + role), 05-imba (Instacart -> schema imba),
-│                               #   06-retail (retail data warehouse -> schema retail)
-├── data/structured/            # CSVs loaded by db/init (instacart/ is large: local only, ignored)
-├── examples/few_shot.yaml      # curated question -> SQL pairs, indexed for retrieval
+│                               #   02-roles (read-only role), 04-chat-memory (chat_memory
+│                               #   tables + role), 06-retail (retail data warehouse -> schema
+│                               #   retail: the only dataset)
+├── data/structured/            # CSVs loaded by db/init (retail data: local only, ignored)
+├── examples/few_shot.yaml      # curated retail question -> SQL pairs, indexed for retrieval
 ├── evaluation/
-│   ├── cases.yaml              # eval cases: question + reference SQL (+ history for follow-ups)
+│   ├── cases.yaml              # eval cases: question + reference SQL, or no_sql (chat), or
+│   │                           #   clarify (vague); history for follow-ups
 │   └── results/                # rag-sql-eval output, one JSON per model and run (local only, ignored)
 ├── notebooks/demo.ipynb        # main entry point (demo2.ipynb, ...: local scratch, ignored)
 ├── src/rag_sql/
 │   ├── config.py               # Settings (pydantic-settings); the ONLY place env vars are read
-│   ├── llm.py                  # get_chat_model(), get_embeddings() (caches query vectors), list_chat_models()
+│   ├── llm.py                  # get_chat_model(), get_router_model(), with_json_schema(), get_embeddings() (caches query vectors), list_chat_models()
 │   ├── metrics.py              # NodeMetric/TurnMetrics, usage_of(), summarize(), format_* (pure)
 │   ├── retrieval.py            # schema + few-shot Documents, build_index(), get_retriever()
 │   ├── tracing.py              # run_config(): Langfuse callback + trace attributes for one run
@@ -69,6 +70,7 @@ RAG-SQL-Layer/
 │   │   └── queries.py          # query examples (thumbs up, pgvector): QueryHistory, get_query_history()
 │   ├── agent/
 │   │   ├── state.py            # AgentState TypedDict (shared by nodes, graph, UI)
+│   │   ├── schemas.py          # pydantic replies of the JSON agents (RouteDecision) + the schema sent to the model
 │   │   ├── prompts.py          # all prompt templates (no prompts elsewhere)
 │   │   ├── formatting.py       # state -> prompt text (schema, rows, history), model reply -> thinking + SQL
 │   │   ├── nodes.py            # one function per graph node (+ turn_from_state())
@@ -105,24 +107,29 @@ Structure rules:
 ```
 START
   └─> load_history       # ChatStore: last CHAT_HISTORY_TURNS turns of the thread (if thread_id set)
-  └─> condense_question  # LLM: follow-up + history -> standalone question (no call on turn 1)
+  └─> route_question     # ROUTER agent (JSON, no thinking): intent data | chat | clarify + standalone question
   └─> retrieve_context   # retriever (on the standalone question): tables/columns + few-shot examples
+        ├─ chat/clarify ─> answer     (nothing is validated or run)
   └─> find_similar_queries  # QueryHistory: up to QUERY_HISTORY_K similar query examples (thumbs up)
   └─> generate_sql       # LLM: question + context + similar queries + earlier Q/SQL (+ previous error) -> SQL
-        ├─ NO_SQL ───> answer         (not a question about the data: nothing is validated or run)
   └─> validate_sql       # db/query.py validate_sql(): parse, reject non-read-only, cap LIMIT at row limit + 1
         ├─ invalid ──> generate_sql   (while attempts < MAX_SQL_RETRIES)
   └─> execute_sql        # db/query.py run_query()
         ├─ DB error ─> generate_sql   (while attempts < MAX_SQL_RETRIES; never when the database is unavailable)
   └─> answer             # LLM: question + SQL + rows (+ earlier Q/A) -> natural-language answer
-                         #   (after NO_SQL: CHAT_REPLY_PROMPT, question + table names -> short reply)
+                         #   (chat: CHAT_REPLY_PROMPT, question + table names -> short reply;
+                         #    clarify: CLARIFY_PROMPT, question + schema + what is unclear -> a question back)
   └─> save_turn          # ChatStore: append this turn (also failed ones); a failed save is only logged
 END
 ```
 
+The router is the first LLM agent of a multi-agent design (router, then SQL writer, then answerer; a planner, repair agent and result reviewer are planned). Each agent is a narrow model role with its own short prompt, and the graph's `route_*` functions, not a model, decide who runs next.
+
+`route_question` replies in JSON (`schemas.RouteDecision`, constrained with Ollama's `format`; `llm.with_json_schema()`), without thinking. `intent` is `data` (write SQL), `chat` (not about the data, or a request to change it: nothing runs) or `clarify` (about the data but too vague, e.g. a ranking with no measure: the answer node asks one question back, from the retrieved schema, and the user's reply arrives as a follow-up that the router combines with it; the router is told never to clarify twice in a row). It also rewrites a follow-up into `standalone_question` (chat messages are copied as they are). A reply that isn't valid JSON falls back to a plain data question. The router uses `OLLAMA_ROUTER_MODEL` when set, else the chat model with thinking off (`llm.get_router_model()`); `build_graph(router_llm=)` overrides both.
+
 Every node is wrapped by `timed()` in `graph.py`: its update also carries one `NodeMetric` (node, SQL attempt, wall ms, and for model calls Ollama's model ms, load ms and tokens). Nodes that call the model return `llm_usage` (`metrics.usage_of(message)`); the wrapper moves it into the metric, so it never reaches state.
 
-`AgentState` (in `agent/state.py`) carries: `thread_id`, `history` (earlier `Turn`s), `question`, `standalone_question`, `context` (retrieved docs), `similar_queries` (`PastQuery`s), `reasoning`, `sql`, `no_sql` (the model replied `NO_SQL`: the question isn't about the data, so `sql` is None and nothing runs), `error`, `db_unavailable` (the error is a connection/availability problem, so it isn't retried), `attempts`, `result` (columns + rows), `answer`, `answer_reasoning`, `turn_id`, `metrics` (`NodeMetric`s; the reducer appends, so every SQL attempt keeps its entries) and `turn_metrics` (their summary, set by `save_turn`).
+`AgentState` (in `agent/state.py`) carries: `thread_id`, `history` (earlier `Turn`s), `question`, `intent` (the router's decision), `standalone_question`, `unclear` (for `clarify`: what is missing), `context` (retrieved docs), `similar_queries` (`PastQuery`s), `reasoning`, `sql`, `no_sql` (the router chose `chat` or `clarify`, so `sql` is None and nothing runs), `error`, `db_unavailable` (the error is a connection/availability problem, so it isn't retried), `attempts`, `result` (columns + rows), `answer`, `answer_reasoning`, `turn_id`, `metrics` (`NodeMetric`s; the reducer appends, so every SQL attempt keeps its entries) and `turn_metrics` (their summary, set by `save_turn`).
 
 Chat history: every run is one turn. History is loaded and saved only when the input has a `thread_id`; without one, `history` passed in the input is used and the new turn is returned in state, so a stateless caller can carry it. Stored turns hold question, standalone question, SQL, row count, answer, error, the model's thinking (`sql_reasoning` of the last SQL attempt, `answer_reasoning`) the chat `model` that answered (injected into `save_turn` by `build_graph` from the LLM's name) and the turn's `metrics` (one row per node run in `chat_memory.turn_metrics`, written in the same transaction; `save_turn` is left out, so the time ends with the answer), never result rows. Loaded turns carry their row `id`. Thinking is never put into prompts.
 
@@ -140,11 +147,11 @@ Rules:
 | Node update | Rendered as |
 |---|---|
 | `load_history.history` | Muted line: number of earlier questions in context; skipped when none |
-| `condense_question.standalone_question` | Muted "Interpreted as: ..." line, only when it differs from the question |
+| `route_question.standalone_question` | Muted "Interpreted as: ..." line, only when it differs from the question |
+| `route_question.intent` | `chat`: muted "No SQL: not a question about the data." line. `clarify`: muted "No SQL yet: the question is too vague. <what is unclear>" line; the answer is the question back |
 | `find_similar_queries.similar_queries` | Collapsible muted "Similar past queries (n)": question, similarity, SQL; skipped when none |
 | `generate_sql.reasoning` | Collapsible / muted "Thinking" block (Markdown) |
 | `generate_sql.sql` | Header "SQL" + syntax-highlighted ```sql block |
-| `generate_sql.no_sql` | Muted "No SQL: not a question about the data." line instead of the SQL (also for saved turns with no SQL and no error) |
 | `validate_sql` / `execute_sql` error | Red warning showing the error and retry count (or "database unavailable, not retried") |
 | `execute_sql.result` | Header "SQL output" + `pandas.DataFrame` (truncated to display limit) |
 | `answer.answer_reasoning` | Collapsible "Thinking (answer)" block; skipped when none |
@@ -209,6 +216,7 @@ All settings are read in `src/rag_sql/config.py` through a single `Settings` cla
 | `CHAT_DB_USER` / `CHAT_DB_PASSWORD` | Chat history, query history and metrics role (`SELECT`, `INSERT` on `chat_memory` tables, `UPDATE` of `query_examples.enabled`) | `rag_memory` |
 | `OLLAMA_BASE_URL` | Ollama over Tailscale | `http://<tailscale-host>:11434` |
 | `OLLAMA_CHAT_MODEL` | Chat / SQL model (the web UI's default choice) | e.g. `qwen3:14b` |
+| `OLLAMA_ROUTER_MODEL` | Model of the router agent; empty = the chat model, with thinking off | empty, or e.g. `qwen3:4b` |
 | `OLLAMA_EMBED_MODEL` | Embedding model | e.g. `nomic-embed-text` |
 | `OLLAMA_REASONING` | Enable thinking output | `true` |
 | `SQL_ROW_LIMIT` | Max rows returned (queries get `LIMIT` of this + 1, to detect truncation) | `200` |
@@ -216,7 +224,7 @@ All settings are read in `src/rag_sql/config.py` through a single `Settings` cla
 | `MAX_SQL_RETRIES` | Regenerate attempts on invalid/failed SQL | `3` |
 | `VECTOR_COLLECTION` | pgvector collection name | `schema_docs` |
 | `RETRIEVAL_K` | Docs retrieved per question | `6` |
-| `DB_SCHEMAS` | Schemas indexed and shown to the model (comma-separated; never `chat_memory`) | `public,imba,retail` |
+| `DB_SCHEMAS` | Schemas indexed and shown to the model (comma-separated; never `chat_memory`). Only `retail` has data | `retail` |
 | `CHAT_HISTORY_TURNS` | Earlier turns shown to the model (0 = none; turns are still saved) | `5` |
 | `QUERY_HISTORY_K` | Most similar past queries given to the model (0 = none; queries are still saved) | `5` |
 | `QUERY_HISTORY_MIN_SIMILARITY` | Cosine similarity cutoff for past queries (tune per embedding model) | `0.75` |
@@ -271,6 +279,7 @@ uv run rag-sql-metrics [--days 30] [--model M]
 
 # Evaluation (needs Postgres + Ollama; results in evaluation/results/, local only)
 uv run rag-sql-eval run [--models A,B] [--tags T] [--limit N] [--repeat K] [--with-history]
+uv run rag-sql-eval run --router-only    # only the router: no DB or SQL model, seconds; checks intents
 uv run rag-sql-eval compare evaluation/results/OLD.json evaluation/results/NEW.json
 
 # Notebook
@@ -299,7 +308,7 @@ uv run ruff check . && uv run ruff format .
 
 ## Testing
 
-- Unit-test `validate_sql()`, routing functions, and nodes with a fake LLM (`langchain_core.language_models.fake_chat_models.FakeListChatModel`) and no network. Use `InMemoryChatStore` for chat history and `InMemoryQueryHistory` with `tests.conftest.KeywordEmbeddings` for query history.
+- Unit-test `validate_sql()`, routing functions, and nodes with a fake LLM (`langchain_core.language_models.fake_chat_models.FakeListChatModel`) and no network. A fake gives its replies in call order and is shared by the router, so a run's first reply is the router's JSON (`tests.conftest.route_reply()`, or `ROUTE_DATA` for a data question). Use `InMemoryChatStore` for chat history and `InMemoryQueryHistory` with `tests.conftest.KeywordEmbeddings` for query history.
 - Integration tests that need Postgres or Ollama are marked `@pytest.mark.integration` and skipped by default (and in CI).
 - Give fakes usage with `AIMessage(usage_metadata=..., response_metadata={"total_duration": ...})` to test metrics; `tests/test_graph.py::OllamaLikeModel` streams like ChatOllama (usage on the last chunk).
 - `tests/test_eval_*.py` cover cases, scoring, the runner and the results without network, `tests/test_cli.py` the CLIs; the references run in `tests/test_integration.py`.
@@ -308,9 +317,11 @@ uv run ruff check . && uv run ruff format .
 
 ## When changing things
 
+- **Router prompt or model**: the router decides what runs, so a wrong `intent` is the most costly mistake. Change `ROUTER_PROMPT` / `OLLAMA_ROUTER_MODEL`, then run `uv run rag-sql-eval run` and compare ("declined" and "unneeded_sql" are router mistakes).
 - **New model**: pull it on the Ollama machine; the web UI lists it within a minute. To make it the default (and the notebook's model), change `OLLAMA_CHAT_MODEL` in `.env`. No code change. Compare it first: `uv run rag-sql-eval run --models old,new`.
 - **Prompt, retrieval or agent change**: run `uv run rag-sql-eval run` before and after, then `rag-sql-eval compare` the two result files.
-- **New eval case**: add it to `evaluation/cases.yaml` (answer independent of label spelling, reference columns only what the answer needs, fewer rows than `SQL_ROW_LIMIT`; a question that isn't about the data gets `no_sql: true` instead of `sql`, and scores "unneeded_sql" if the agent writes SQL, while a data question answered with `NO_SQL` scores "declined"); `uv run pytest -m integration -k eval_references` checks the references.
+- **New eval case**: add it to `evaluation/cases.yaml` (its header has the rules: answer independent of label spelling, no ties in rankings, reference columns only what the answer needs, fewer rows than `SQL_ROW_LIMIT`, a difficulty tag and a group tag, no question that is in `few_shot.yaml` or `ROUTER_PROMPT`). A case has `sql`, `no_sql: true` (chat) or `clarify: true` (too vague: two plausible readings give different answers). Outcomes for a case the router sent the wrong way: "declined" (treated a data or vague question as chat), "unneeded_clarify" (asked back although it could answer), "guessed" (wrote SQL for a vague question), "unneeded_sql" (wrote SQL for chat). `uv run pytest -m integration -k eval_references` checks the references.
+- **Result files** record the prompt hash (`prompt_version()` in `agent/prompts.py`, changes with any prompt), the router model, and per case the router's intent and its rewrite of the question, so `rag-sql-eval compare` shows what changed. The baseline is in `evaluation/BASELINE.md`. At temperature 0, `--repeat` inside one run mostly reproduces the same answers: to measure noise, run the evaluation again as a separate invocation. `--router-only` is the fast loop for router prompt or model changes; check a change against messages that are not eval cases too, or it only learns the eval.
 - **New node / step**: add the function in `nodes.py`, the state fields in `state.py`, wire it in `graph.py`, and map its update to `Step`s in `steps.steps_from_update()`. Touch `render_step()` in `ui/notebook.py` and `ui/web_chat.py` only for a new `StepKind`.
 - **Schema changed or new few-shot examples**: re-run `uv run rag-sql-index`. Query examples that no longer fit the schema can be hidden on the web UI's Query examples page (or `uv run rag-sql-history disable <id>`).
 - **New embedding model** (`OLLAMA_EMBED_MODEL`): re-run `uv run rag-sql-index` and `uv run rag-sql-history backfill`, then re-tune `QUERY_HISTORY_MIN_SIMILARITY`.

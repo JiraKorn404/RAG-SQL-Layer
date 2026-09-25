@@ -24,16 +24,41 @@ from sqlglot import exp
 from rag_sql.db.query import DIALECT, QueryResult
 
 Outcome = Literal[
-    "correct",  # same values in the same shape (or NO_SQL for a question not about the data)
+    "correct",  # same values in the same shape (or the right reply for a case without SQL)
     "correct_extra_columns",  # every reference column is there, plus more
     "wrong_result",  # the SQL ran, but the result differs
-    "declined",  # the agent replied NO_SQL to a question about the data
-    "unneeded_sql",  # the agent wrote SQL for a question that isn't about the data
+    "declined",  # the agent treated a data question as chat (or a vague one as chat)
+    "unneeded_clarify",  # the agent asked back although it could answer (or it was chat)
+    "guessed",  # the agent wrote SQL for a question that was too vague
+    "unneeded_sql",  # the agent wrote SQL for a message that isn't about the data
     "sql_failed",  # no SQL ran: retries ran out
     "db_unavailable",  # the database couldn't be used
     "agent_error",  # the run raised an exception
 ]
 CORRECT: tuple[Outcome, ...] = ("correct", "correct_extra_columns")
+
+# The intent the router should choose for each kind of case (agent/schemas.py Intent).
+EXPECTED_INTENT = {"sql": "data", "chat": "chat", "clarify": "clarify"}
+
+# Outcome of a case the router sent the wrong way, by (kind of case, intent chosen).
+_MISROUTED: dict[tuple[str, str], Outcome] = {
+    ("sql", "chat"): "declined",
+    ("sql", "clarify"): "unneeded_clarify",
+    ("chat", "data"): "unneeded_sql",
+    ("chat", "clarify"): "unneeded_clarify",
+    ("clarify", "data"): "guessed",
+    ("clarify", "chat"): "declined",
+}
+
+
+def route_outcome(kind: str, intent: str) -> Outcome:
+    """ "correct" when the router chose the intent the case expects, else what the mistake is
+    called. For a case that needs SQL, "correct" only means the routing was right: the SQL is
+    still to be compared."""
+    if intent == EXPECTED_INTENT[kind]:
+        return "correct"
+    return _MISROUTED[kind, intent]
+
 
 # How far two numbers that aren't both whole may differ: rounding to 2 decimals, or 0.01 %.
 ABS_TOL = 0.005

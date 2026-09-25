@@ -11,11 +11,11 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from rag_sql.agent.graph import (
     build_graph,
     route_after_execute,
-    route_after_generate,
+    route_after_retrieve,
     route_after_validate,
 )
 from rag_sql.db.query import QueryResult
-from tests.conftest import EXAMPLE_DOC, TABLE_DOC, fake_llm
+from tests.conftest import EXAMPLE_DOC, ROUTE_DATA, TABLE_DOC, fake_llm, route_reply
 
 
 @pytest.mark.parametrize(
@@ -44,9 +44,10 @@ def test_route_after_execute(state: dict, expected: str) -> None:
     assert route_after_execute(state, max_retries=2) == expected
 
 
-def test_route_after_generate() -> None:
-    assert route_after_generate({"sql": "SELECT 1", "no_sql": False}) == "validate_sql"
-    assert route_after_generate({"sql": None, "no_sql": True}) == "answer"
+def test_route_after_retrieve() -> None:
+    assert route_after_retrieve({"intent": "data", "no_sql": False}) == "find_similar_queries"
+    assert route_after_retrieve({"intent": "chat", "no_sql": True}) == "answer"
+    assert route_after_retrieve({"intent": "clarify", "no_sql": True}) == "answer"
 
 
 class PromptRecorder(BaseCallbackHandler):
@@ -75,7 +76,7 @@ def _nodes_run(
 
 
 def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
-    llm = fake_llm("```sql\nSELECT emp_name, salary FROM employees\n```", "Employee_1.")
+    llm = fake_llm(ROUTE_DATA, "```sql\nSELECT emp_name, salary FROM employees\n```", "Employee_1.")
     graph = build_graph(
         llm=llm,
         retriever=retriever,
@@ -87,7 +88,7 @@ def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
 
     assert order == [
         "load_history",
-        "condense_question",
+        "route_question",
         "retrieve_context",
         "find_similar_queries",
         "generate_sql",
@@ -96,6 +97,7 @@ def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
         "answer",
         "save_turn",
     ]
+    assert (state["intent"], state["no_sql"]) == ("data", False)
     assert state["standalone_question"] == "Who earns the most?"
     assert state["sql"].rstrip().endswith("LIMIT 51")  # row_limit + 1, to detect truncation
     assert state["result"].rows == [("Employee_1", 100.0)]
@@ -109,6 +111,7 @@ def test_happy_path(settings, retriever, ok_runner, chat_store, stores) -> None:
 def test_every_node_run_is_timed(settings, retriever, chat_store, stores) -> None:
     usage = {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
     llm = fake_llm(
+        AIMessage(content=ROUTE_DATA, usage_metadata=usage),
         AIMessage(content="DROP TABLE employees", usage_metadata=usage),  # rejected: a retry
         AIMessage(content="```sql\nSELECT 1\n```", usage_metadata=usage),
         AIMessage(content="One.", usage_metadata=usage),
@@ -125,7 +128,7 @@ def test_every_node_run_is_timed(settings, retriever, chat_store, stores) -> Non
     # The reducer keeps one metric per node run, so both SQL attempts show.
     assert [(m["node"], m["attempt"]) for m in state["metrics"]] == [
         ("load_history", 0),
-        ("condense_question", 0),
+        ("route_question", 0),
         ("retrieve_context", 0),
         ("find_similar_queries", 0),
         ("generate_sql", 1),
@@ -138,6 +141,7 @@ def test_every_node_run_is_timed(settings, retriever, chat_store, stores) -> Non
     ]
     assert all(m["ms"] >= 0 for m in state["metrics"])
     assert [m["node"] for m in state["metrics"] if m["input_tokens"]] == [
+        "route_question",
         "generate_sql",
         "generate_sql",
         "answer",
@@ -148,7 +152,7 @@ def test_every_node_run_is_timed(settings, retriever, chat_store, stores) -> Non
     assert saved["metrics"] == state["turn_metrics"]
     # The turn's time ends with the answer: saving it is left out.
     assert saved["metrics"]["nodes"][-1]["node"] == "answer"
-    assert (saved["metrics"]["attempts"], saved["metrics"]["input_tokens"]) == (2, 300)
+    assert (saved["metrics"]["attempts"], saved["metrics"]["input_tokens"]) == (2, 400)
 
 
 def test_retries_after_invalid_then_db_error(
@@ -163,6 +167,7 @@ def test_retries_after_invalid_then_db_error(
         return ok_runner(sql)
 
     llm = fake_llm(
+        ROUTE_DATA,
         "DELETE FROM employees",
         "```sql\nSELECT nope FROM employees\n```",
         "```sql\nSELECT emp_name FROM employees\n```",
@@ -188,7 +193,7 @@ def test_unavailable_database_is_not_retried(settings, retriever, chat_store, st
     def runner(sql: str) -> QueryResult:
         raise OperationalError(sql, {}, Exception("connection refused"))
 
-    llm = fake_llm("```sql\nSELECT emp_name FROM employees\n```")  # one reply: no retry
+    llm = fake_llm(ROUTE_DATA, "```sql\nSELECT emp_name FROM employees\n```")  # no retry replies
     graph = build_graph(
         llm=llm, retriever=retriever, query_runner=runner, **stores, settings=settings
     )
@@ -203,7 +208,7 @@ def test_unavailable_database_is_not_retried(settings, retriever, chat_store, st
 
 
 def test_gives_up_after_max_retries(settings, retriever, ok_runner, chat_store, stores) -> None:
-    llm = fake_llm(*["DROP TABLE employees"] * 3)
+    llm = fake_llm(ROUTE_DATA, *["DROP TABLE employees"] * 3)
     graph = build_graph(
         llm=llm,
         retriever=retriever,
@@ -230,11 +235,12 @@ def test_follow_up_uses_history(settings, ok_runner, chat_store, stores) -> None
         return [TABLE_DOC, EXAMPLE_DOC]
 
     llm = fake_llm(
-        # turn 1: no condense call
+        # turn 1
+        ROUTE_DATA,
         "```sql\nSELECT department, avg(salary) FROM employees GROUP BY 1 ORDER BY 2 DESC\n```",
         "Sales has the highest average salary.",
         # turn 2
-        "Which department has the lowest average salary?",
+        route_reply(standalone="Which department has the lowest average salary?"),
         "```sql\nSELECT department, avg(salary) FROM employees GROUP BY 1 ORDER BY 2\n```",
         "HR has the lowest.",
     )
@@ -250,14 +256,14 @@ def test_follow_up_uses_history(settings, ok_runner, chat_store, stores) -> None
     _nodes_run(graph, "Which department has the highest average salary?", "t1", [recorder])
     order, state = _nodes_run(graph, "And the lowest?", "t1", [recorder])
 
-    assert order[:2] == ["load_history", "condense_question"]
+    assert order[:2] == ["load_history", "route_question"]
     assert state["standalone_question"] == "Which department has the lowest average salary?"
     assert state["attempts"] == 1
     assert retrieved_for[-1] == "Which department has the lowest average salary?"
 
-    condense_prompt, sql_prompt, answer_prompt = recorder.prompts[2:]
-    assert "Sales has the highest average salary." in condense_prompt
-    assert "Follow-up question: And the lowest?" in condense_prompt
+    route_prompt, sql_prompt, answer_prompt = recorder.prompts[3:]
+    assert "Sales has the highest average salary." in route_prompt
+    assert "Latest message: And the lowest?" in route_prompt
     assert "ORDER BY\n  2 DESC" in sql_prompt  # the previous turn's SQL, as normalized
     assert "Question: Which department has the lowest average salary?" in sql_prompt
     assert "Sales has the highest average salary." in answer_prompt
@@ -272,7 +278,7 @@ def test_follow_up_uses_history(settings, ok_runner, chat_store, stores) -> None
 
 
 def test_threads_are_isolated(settings, retriever, ok_runner, chat_store, stores) -> None:
-    llm = fake_llm("SELECT 1", "One.", "SELECT 2", "Two.")
+    llm = fake_llm(ROUTE_DATA, "SELECT 1", "One.", ROUTE_DATA, "SELECT 2", "Two.")
     graph = build_graph(
         llm=llm,
         retriever=retriever,
@@ -283,7 +289,7 @@ def test_threads_are_isolated(settings, retriever, ok_runner, chat_store, stores
     _nodes_run(graph, "first", "a")
     _, state = _nodes_run(graph, "second", "b")
 
-    # Thread "b" has no history, so there is no condense call and no carried-over turn.
+    # Thread "b" has no history: no carried-over turn.
     assert state["standalone_question"] == "second"
     assert [t["question"] for t in state["history"]] == ["second"]
     assert [t["question"] for t in chat_store.load("a")] == ["first"]
@@ -294,8 +300,10 @@ def test_past_query_is_retrieved_in_another_thread(
     settings, retriever, ok_runner, stores, query_history
 ) -> None:
     llm = fake_llm(
+        ROUTE_DATA,
         "```sql\nSELECT department, avg(salary) AS avg_salary FROM employees GROUP BY 1\n```",
         "Per department.",
+        ROUTE_DATA,
         "```sql\nSELECT 1\n```",
         "Done.",
     )
@@ -313,7 +321,7 @@ def test_past_query_is_retrieved_in_another_thread(
     [similar] = second["similar_queries"]
     assert similar.question == "What is the average salary per department?"
     assert similar.similarity == pytest.approx(1.0, abs=1e-3)
-    sql_prompt = recorder.prompts[0]  # new thread: no condense call
+    sql_prompt = recorder.prompts[1]  # after the router's prompt
     assert "Similar questions answered earlier" in sql_prompt
     assert "AS avg_salary" in sql_prompt
 
@@ -322,7 +330,7 @@ def test_runs_never_save_query_examples(
     settings, retriever, ok_runner, stores, query_history
 ) -> None:
     graph = build_graph(
-        llm=fake_llm("SELECT 1", "One row."),
+        llm=fake_llm(ROUTE_DATA, "SELECT 1", "One row."),
         retriever=retriever,
         query_runner=ok_runner,
         settings=settings,
@@ -335,32 +343,126 @@ def test_runs_never_save_query_examples(
     assert query_history.examples() == []
 
 
-def test_no_sql_question_runs_nothing(settings, retriever, chat_store, stores) -> None:
-    def must_not_run(_sql: str) -> QueryResult:
-        raise AssertionError("no query should run")
+def _must_not_run(_sql: str) -> QueryResult:
+    raise AssertionError("no query should run")
 
-    llm = fake_llm("NO_SQL", "Hi! I answer questions about the employees table.")
+
+def test_chat_message_runs_nothing(settings, retriever, chat_store, stores) -> None:
+    llm = fake_llm(route_reply("chat"), "Hi! I answer questions about the employees table.")
     graph = build_graph(
-        llm=llm, retriever=retriever, query_runner=must_not_run, **stores, settings=settings
+        llm=llm, retriever=retriever, query_runner=_must_not_run, **stores, settings=settings
     )
     recorder = PromptRecorder()
     order, state = _nodes_run(graph, "hello, who are you?", "t1", [recorder])
 
-    assert order == [
-        "load_history",
-        "condense_question",
-        "retrieve_context",
-        "find_similar_queries",
-        "generate_sql",
-        "answer",
-        "save_turn",
-    ]
+    assert order == ["load_history", "route_question", "retrieve_context", "answer", "save_turn"]
     assert state["answer"] == "Hi! I answer questions about the employees table."
-    assert (state["no_sql"], state["sql"], state["attempts"]) == (True, None, 1)
+    assert (state["intent"], state["no_sql"], state.get("sql")) == ("chat", True, None)
+    assert "attempts" not in state  # no SQL was generated
     # The reply is written from the table names, not from a query result.
     assert "Tables: employees" in recorder.prompts[1]
     [turn] = chat_store.load("t1")
     assert (turn["sql"], turn["error"], turn["row_count"]) == (None, None, None)
+
+
+def test_vague_question_gets_a_clarifying_question(settings, retriever, chat_store, stores) -> None:
+    llm = fake_llm(
+        route_reply("clarify", unclear="'Best' has no measure."),
+        "Best by salary or by tenure?",
+    )
+    graph = build_graph(
+        llm=llm, retriever=retriever, query_runner=_must_not_run, **stores, settings=settings
+    )
+    recorder = PromptRecorder()
+    order, state = _nodes_run(graph, "Who are the best employees?", "t1", [recorder])
+
+    assert order == ["load_history", "route_question", "retrieve_context", "answer", "save_turn"]
+    assert (state["intent"], state["unclear"]) == ("clarify", "'Best' has no measure.")
+    assert state["answer"] == "Best by salary or by tenure?"
+    # The question is asked from the retrieved schema, with what the router found unclear.
+    assert "Table employees" in recorder.prompts[1]
+    assert "What is unclear: 'Best' has no measure." in recorder.prompts[1]
+    [turn] = chat_store.load("t1")
+    assert (turn["sql"], turn["error"], turn["answer"]) == (None, None, state["answer"])
+
+
+def test_reply_to_a_clarifying_question_becomes_a_data_question(
+    settings, retriever, ok_runner, chat_store, stores
+) -> None:
+    llm = fake_llm(
+        route_reply("clarify", unclear="No measure."),
+        "Best by salary or by tenure?",
+        route_reply(standalone="Who are the highest paid employees?"),
+        "```sql\nSELECT emp_name FROM employees ORDER BY salary DESC\n```",
+        "Employee_1.",
+    )
+    graph = build_graph(
+        llm=llm, retriever=retriever, query_runner=ok_runner, **stores, settings=settings
+    )
+    recorder = PromptRecorder()
+    _nodes_run(graph, "Who are the best employees?", "t1", [recorder])
+    order, state = _nodes_run(graph, "By salary", "t1", [recorder])
+
+    assert "generate_sql" in order
+    assert state["standalone_question"] == "Who are the highest paid employees?"
+    # The router sees its own clarifying question, so it can combine it with the reply.
+    route_prompt = recorder.prompts[2]
+    assert "Answer: Best by salary or by tenure?" in route_prompt
+    assert "Latest message: By salary" in route_prompt
+    # The SQL model sees the earlier vague turn as one that got no SQL.
+    assert "(no SQL was written for this message)" in recorder.prompts[3]
+
+
+def test_unreadable_router_reply_falls_back_to_a_data_question(
+    settings, retriever, ok_runner, stores
+) -> None:
+    llm = fake_llm("I think this is a data question.", "```sql\nSELECT 1\n```", "One.")
+    graph = build_graph(
+        llm=llm, retriever=retriever, query_runner=ok_runner, **stores, settings=settings
+    )
+    _, state = _nodes_run(graph, "How many?")
+
+    assert (state["intent"], state["standalone_question"], state["answer"]) == (
+        "data",
+        "How many?",
+        "One.",
+    )
+
+
+def test_router_has_its_own_model(settings, retriever, stores) -> None:
+    graph = build_graph(
+        llm=fake_llm("Hello!"),
+        router_llm=fake_llm(route_reply("chat")),
+        retriever=retriever,
+        query_runner=_must_not_run,
+        **stores,
+        settings=settings,
+    )
+    _, state = _nodes_run(graph, "hi")
+
+    assert (state["intent"], state["answer"]) == ("chat", "Hello!")
+
+
+def test_router_replies_in_json_without_thinking(settings, retriever, ok_runner, stores) -> None:
+    seen: list[dict] = []
+
+    class Spy(BaseCallbackHandler):
+        def on_chat_model_start(self, serialized: Any, messages: Any, **kwargs: Any) -> None:
+            seen.append(kwargs["invocation_params"])
+
+    graph = build_graph(
+        llm=fake_llm(ROUTE_DATA, "SELECT 1", "One."),
+        retriever=retriever,
+        query_runner=ok_runner,
+        **stores,
+        settings=settings,
+    )
+    _nodes_run(graph, "q", callbacks=[Spy()])
+
+    router_params, sql_params, _ = seen
+    assert router_params["reasoning"] is False
+    assert router_params["format"]["required"] == ["intent", "standalone_question", "unclear"]
+    assert "format" not in sql_params and "reasoning" not in sql_params
 
 
 class OllamaLikeModel(BaseChatModel):
@@ -395,7 +497,7 @@ class OllamaLikeModel(BaseChatModel):
 def test_usage_survives_streamed_model_calls(settings, retriever, ok_runner, stores) -> None:
     # The web UI streams with "messages", which makes llm.invoke() stream: the usage on the
     # final chunk must still reach the node's metric.
-    llm = OllamaLikeModel(replies=["```sql\nSELECT 1\n```", "One."])
+    llm = OllamaLikeModel(replies=[ROUTE_DATA, "```sql\nSELECT 1\n```", "One."])
     graph = build_graph(
         llm=llm, retriever=retriever, query_runner=ok_runner, **stores, settings=settings
     )
@@ -406,4 +508,8 @@ def test_usage_survives_streamed_model_calls(settings, retriever, ok_runner, sto
                 for m in (update or {}).get("metrics", []):
                     if m["input_tokens"]:
                         usage[node] = (m["llm_ms"], m["load_ms"], m["input_tokens"])
-    assert usage == {"generate_sql": (2000, 1500, 50), "answer": (2000, 1500, 50)}
+    assert usage == {
+        "route_question": (2000, 1500, 50),
+        "generate_sql": (2000, 1500, 50),
+        "answer": (2000, 1500, 50),
+    }

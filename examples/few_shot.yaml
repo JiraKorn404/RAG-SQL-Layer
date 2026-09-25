@@ -1,132 +1,68 @@
 # Question -> SQL pairs, embedded into the vector index and retrieved by similarity to the
-# user's question. Keep the SQL valid PostgreSQL for the current schema.
+# user's question. Keep the SQL valid PostgreSQL for the current schema (retail).
 # Re-run `uv run rag-sql-index` after editing.
+#
+# These show patterns, not answers to the evaluation cases: evaluation/cases.yaml must not repeat
+# these questions (checked by tests). Products and categories have no real names, so the examples
+# refer to them by id.
 
-- question: How many employees are there in each department?
+- question: How many orders were placed in each year?
   sql: |
-    SELECT coalesce(department, 'Unknown') AS department, count(*) AS employees
-    FROM employees
+    SELECT extract(year FROM order_date)::int AS year, count(*) AS orders
+    FROM retail.orders
     GROUP BY 1
-    ORDER BY employees DESC;
+    ORDER BY 1;
 
-- question: What is the average salary by city?
+- question: What is the total revenue in each store city?
   sql: |
-    SELECT city, round(avg(salary), 2) AS avg_salary
-    FROM employees
-    WHERE salary IS NOT NULL
-    GROUP BY city
-    ORDER BY avg_salary DESC;
+    SELECT s.city, sum(p.amount) AS revenue
+    FROM retail.payments AS p
+    JOIN retail.orders AS o USING (order_id)
+    JOIN retail.stores AS s USING (store_id)
+    GROUP BY s.city
+    ORDER BY revenue DESC;
 
-- question: What is the average salary and performance rating in each department?
+- question: How many units of each category were sold?
   sql: |
-    SELECT department,
-           round(avg(salary), 2) AS avg_salary,
-           round(avg(performance_rating), 2) AS avg_rating
-    FROM employees
-    WHERE department IS NOT NULL
-    GROUP BY department
-    ORDER BY avg_salary DESC;
+    SELECT c.category_name, sum(i.qty) AS units
+    FROM retail.order_items AS i
+    JOIN retail.products AS p USING (product_id)
+    JOIN retail.categories AS c USING (category_id)
+    GROUP BY c.category_name
+    ORDER BY units DESC;
 
-- question: Who are the 5 highest paid employees?
+- question: What share of shipments has each status?
   sql: |
-    SELECT emp_name, department, salary
-    FROM employees
-    WHERE salary IS NOT NULL
-    ORDER BY salary DESC
+    SELECT status, round(100.0 * count(*) / sum(count(*)) OVER (), 2) AS percent
+    FROM retail.shipments
+    GROUP BY status
+    ORDER BY percent DESC;
+
+- question: What are the 5 most expensive products by list price?
+  sql: |
+    SELECT product_id, price
+    FROM retail.products
+    ORDER BY price DESC, product_id
     LIMIT 5;
 
-- question: How many employees joined each year?
+- question: What is the average salary of the employees at each store?
   sql: |
-    SELECT extract(year FROM join_date)::int AS join_year, count(*) AS employees
-    FROM employees
-    GROUP BY join_year
-    ORDER BY join_year;
+    SELECT store_id, round(avg(salary), 2) AS avg_salary
+    FROM retail.employees
+    GROUP BY store_id
+    ORDER BY store_id;
 
-- question: What share of employees work remotely in each department?
+- question: How many customers signed up in each year?
   sql: |
-    SELECT coalesce(department, 'Unknown') AS department,
-           round(100.0 * count(*) FILTER (WHERE remote_work) / count(*), 1) AS remote_pct
-    FROM employees
+    SELECT extract(year FROM signup_date)::int AS year, count(*) AS customers
+    FROM retail.customers
     GROUP BY 1
-    ORDER BY remote_pct DESC;
+    ORDER BY 1;
 
-- question: Which employees in Engineering have a performance rating of 5?
+- question: How many products does each supplier country provide?
   sql: |
-    SELECT emp_name, city, salary
-    FROM employees
-    WHERE department = 'Engineering' AND performance_rating = 5
-    ORDER BY emp_name;
-
-- question: What is the average performance rating by age group?
-  sql: |
-    SELECT CASE
-             WHEN age < 30 THEN 'Under 30'
-             WHEN age < 40 THEN '30-39'
-             WHEN age < 50 THEN '40-49'
-             ELSE '50+'
-           END AS age_group,
-           round(avg(performance_rating), 2) AS avg_rating,
-           count(*) AS employees
-    FROM employees
-    WHERE age IS NOT NULL AND performance_rating IS NOT NULL
-    GROUP BY age_group
-    ORDER BY min(age);
-
-- question: How many employees are missing salary or department data?
-  sql: |
-    SELECT count(*) FILTER (WHERE salary IS NULL) AS missing_salary,
-           count(*) FILTER (WHERE department IS NULL) AS missing_department
-    FROM employees;
-
-# --- imba (Instacart orders). imba.order_products has ~34M rows: aggregate it by id first,
-# then join the small lookup tables, so queries finish within SQL_TIMEOUT_MS.
-
-- question: What are the 10 most ordered products?
-  sql: |
-    SELECT p.product_name, t.times_ordered
-    FROM (
-        SELECT product_id, count(*) AS times_ordered
-        FROM imba.order_products
-        GROUP BY product_id
-    ) AS t
-    JOIN imba.products AS p ON p.product_id = t.product_id
-    ORDER BY t.times_ordered DESC
-    LIMIT 10;
-
-- question: What is the reorder rate in each department?
-  sql: |
-    SELECT d.department,
-           round(100.0 * sum(t.reorders) / sum(t.items), 1) AS reorder_rate_pct,
-           sum(t.items) AS items_ordered
-    FROM (
-        SELECT product_id, count(*) AS items, count(*) FILTER (WHERE reordered) AS reorders
-        FROM imba.order_products
-        GROUP BY product_id
-    ) AS t
-    JOIN imba.products AS p ON p.product_id = t.product_id
-    JOIN imba.departments AS d ON d.department_id = p.department_id
-    GROUP BY d.department
-    ORDER BY reorder_rate_pct DESC;
-
-- question: At what hour of the day are most orders placed?
-  sql: |
-    SELECT order_hour_of_day, count(*) AS orders
-    FROM imba.orders
-    GROUP BY order_hour_of_day
-    ORDER BY orders DESC;
-
-- question: How many products does an order contain on average?
-  sql: |
-    SELECT round(avg(n_products), 2) AS avg_products_per_order
-    FROM (
-        SELECT order_id, count(*) AS n_products
-        FROM imba.order_products
-        GROUP BY order_id
-    ) AS per_order;
-
-- question: How many days do customers usually wait between orders?
-  sql: |
-    SELECT round(avg(days_since_prior_order), 1) AS avg_days_between_orders,
-           percentile_cont(0.5) WITHIN GROUP (ORDER BY days_since_prior_order) AS median_days
-    FROM imba.orders
-    WHERE days_since_prior_order IS NOT NULL;
+    SELECT s.country, count(*) AS products
+    FROM retail.products AS p
+    JOIN retail.suppliers AS s USING (supplier_id)
+    GROUP BY s.country
+    ORDER BY products DESC;

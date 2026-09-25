@@ -8,7 +8,7 @@ from pydantic import SecretStr
 from rag_sql import tracing
 from rag_sql.agent.graph import build_graph
 from rag_sql.config import Settings
-from tests.conftest import fake_llm
+from tests.conftest import ROUTE_DATA, fake_llm
 
 
 @pytest.fixture
@@ -88,11 +88,11 @@ def test_run_callbacks_reach_the_nodes_and_their_model_calls(
     settings, retriever, ok_runner, stores
 ) -> None:
     # Tracing relies on this: the nodes need no changes to be traced.
-    llm = fake_llm("```sql\nSELECT emp_name FROM employees\n```", "Employee_1.")
+    llm = fake_llm(ROUTE_DATA, "```sql\nSELECT emp_name FROM employees\n```", "Employee_1.")
     graph = build_graph(
         llm=llm, retriever=retriever, query_runner=ok_runner, **stores, settings=settings
     )
     recorder = Recorder()
     graph.invoke({"question": "Who earns the most?"}, config={"callbacks": [recorder]})
-    assert {"generate_sql", "execute_sql", "answer"} <= set(recorder.chains)
-    assert recorder.model_calls == 2  # generate_sql and answer (turn 1: no condense call)
+    assert {"route_question", "generate_sql", "execute_sql", "answer"} <= set(recorder.chains)
+    assert recorder.model_calls == 3  # route_question, generate_sql and answer

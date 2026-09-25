@@ -1,27 +1,72 @@
 """All prompt templates. Edit prompts here only."""
 
+import hashlib
+
 from langchain_core.prompts import ChatPromptTemplate
 
-# The whole reply of the SQL model when the question can't be answered from the database.
-NO_SQL = "NO_SQL"
-
-CONDENSE_PROMPT = ChatPromptTemplate.from_messages(
+# The router's reply is JSON (schemas.RouteDecision). Everything fixed is in the system message and
+# the conversation comes last, so the model server can reuse its cache of the prompt start.
+ROUTER_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You rewrite follow-up questions about a database so they can be understood without "
-            "the conversation.\n\n"
-            "Rules:\n"
+            "You are the first step of an app that answers questions about a PostgreSQL database "
+            "by writing and running SQL. Read the latest message of the conversation and reply "
+            "with one JSON object with the keys intent, standalone_question and unclear.\n\n"
+            "intent:\n"
+            '- "data": the message asks for something the database can compute, and says what '
+            "to compute: a count, total, average, share, a list, or a ranking by a stated "
+            'measure ("most orders", "highest total payments", "sold the most units").\n'
+            '- "chat": the message is not a question about the data: a greeting, thanks, small '
+            "talk, a question about the assistant, general knowledge, or a request to change "
+            "data (the app is read-only).\n"
+            '- "clarify": the message is about the data, but it does not say what to measure, '
+            "or it has several plausible meanings that would give different answers. Choose it "
+            "for:\n"
+            '  - a ranking word with no measure: "best", "top", "biggest", "largest", "most '
+            'important", "popular", "doing well". Which measure to rank by (a count, a total '
+            "amount, an average) is never yours to pick.\n"
+            '  - an open question about how something is going ("how is X doing", "is X '
+            'improving") with no metric.\n'
+            "  - a term with several possible meanings, or a reference the conversation "
+            "doesn't resolve.\n"
+            '  Only two details have a sensible default and never need "clarify": how many '
+            "rows to list (10) and which period (all of it).\n"
+            "  If the previous assistant message was itself a clarifying question, never "
+            'choose "clarify" again: make the most reasonable assumption and choose "data".\n\n'
+            "standalone_question: the latest message rewritten so it can be understood without "
+            "the conversation.\n"
             '- Use the conversation to resolve references such as "it", "they", "that '
             'department", "the same" or "and the lowest?".\n'
-            "- Keep every filter, grouping and number from the follow-up. Carry over conditions "
-            "from earlier questions only when the follow-up clearly continues them.\n"
-            "- If the follow-up already stands on its own, return it unchanged.\n"
-            "- Reply with the rewritten question only: no explanation, no SQL, no quotes.",
+            "- Keep every filter, grouping and number from the message. Carry over conditions "
+            "from earlier questions only when the message clearly continues them.\n"
+            "- If the previous assistant message was a clarifying question and the latest message "
+            "answers it, combine both into one complete question.\n"
+            '- If the message already stands on its own, or the intent is "chat", copy it '
+            "unchanged.\n\n"
+            'unclear: for "clarify", one short sentence saying what is missing or ambiguous. '
+            'Otherwise "".\n\n'
+            "Examples (message -> reply):\n"
+            '- "What is the average price of the products of each supplier?" -> {{"intent": '
+            '"data", "standalone_question": "What is the average price of the products of each '
+            'supplier?", "unclear": ""}}\n'
+            '- "Which suppliers have the most products?" -> {{"intent": "data", '
+            '"standalone_question": "Which suppliers have the most products?", "unclear": ""}}\n'
+            '- "Who are our best customers?" -> {{"intent": "clarify", "standalone_question": '
+            '"Who are our best customers?", "unclear": "\'Best\' has no measure: it could mean '
+            'revenue, number of orders or something else."}}\n'
+            '- "How is shipping going?" -> {{"intent": "clarify", "standalone_question": '
+            '"How is shipping going?", "unclear": "No metric: it could mean delivery times, late '
+            'shipments or the number of shipments, and no period."}}\n'
+            '- "Thanks, that helps!" -> {{"intent": "chat", "standalone_question": "Thanks, that '
+            'helps!", "unclear": ""}}\n'
+            '- after "Which store city has the highest average salary?", "And the lowest?" -> '
+            '{{"intent": "data", "standalone_question": "Which store city has the lowest '
+            'average salary?", "unclear": ""}}',
         ),
         (
             "human",
-            "Conversation so far (oldest first):\n{history}\n\nFollow-up question: {question}",
+            "Conversation so far (oldest first):\n{history}\n\nLatest message: {question}",
         ),
     ]
 )
@@ -45,11 +90,7 @@ SQL_GENERATION_PROMPT = ChatPromptTemplate.from_messages(
             "- If earlier questions from the conversation are shown and the new question builds "
             "on one, start from its SQL.\n"
             "- Return at most {row_limit} rows.\n"
-            "- Reply with the query in a single ```sql code block and nothing else.\n"
-            "- Exception: if the question is not about the data at all (a greeting, small talk, "
-            "a question about you, or general knowledge the database doesn't hold), don't write "
-            f"a query: reply with exactly {NO_SQL} and nothing else. Never write a placeholder "
-            "query that answers a different question.",
+            "- Reply with the query in a single ```sql code block and nothing else.",
         ),
         (
             "human",
@@ -102,7 +143,8 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
 # turns.
 ANSWER_HISTORY = "Earlier in this conversation (oldest first):\n{turns}\n\n"
 
-# Used by the answer node instead of ANSWER_PROMPT when the SQL model replied NO_SQL.
+# Used by the answer node instead of ANSWER_PROMPT when the router found the message is not about
+# the data.
 CHAT_REPLY_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -112,8 +154,40 @@ CHAT_REPLY_PROMPT = ChatPromptTemplate.from_messages(
             "not a question about the data.\n\n"
             "Reply in two or three sentences: respond to a greeting or a question about you, say "
             "that you answer questions about the data in the tables below, and suggest one or two "
-            "example questions about them. Never state facts or numbers about the data.",
+            "example questions about them. If they ask you to change data, say that you can only "
+            "read it. Never state facts or numbers about the data.",
         ),
         ("human", "Tables: {tables}\n\n{history}Message: {question}"),
     ]
 )
+
+# Used by the answer node when the router found the question too vague for one query.
+CLARIFY_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are the assistant of a question-answering app over a PostgreSQL database: you "
+            "answer questions about its data by writing and running SQL. The user's question is "
+            "too vague to answer with one query.\n\n"
+            "Ask one short clarifying question that gets the missing detail. Offer two or three "
+            "concrete options that exist in the schema below (measures, columns, groupings or "
+            "periods). Don't answer the question, don't write SQL and never state facts or "
+            "numbers about the data. Reply with the question only, in one or two sentences.",
+        ),
+        (
+            "human",
+            "Database schema:\n{schema}\n\n{history}Question: {question}\n"
+            "What is unclear: {unclear}",
+        ),
+    ]
+)
+
+
+def prompt_version() -> str:
+    """A short hash of every prompt in this module. It changes whenever a prompt does, so result
+    files and traces say which prompts produced them."""
+    digest = hashlib.sha1()
+    for name, value in sorted(globals().items()):
+        if isinstance(value, ChatPromptTemplate | str) and name.isupper():
+            digest.update(f"{name}={value!r}".encode())
+    return digest.hexdigest()[:8]

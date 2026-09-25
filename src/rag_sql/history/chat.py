@@ -191,7 +191,8 @@ def get_chat_store(settings: Settings | None = None) -> ChatStore:
 class ModelStats:
     model: str
     turns: int
-    # Share of turns answered without error: their SQL ran, or no SQL was needed (NO_SQL).
+    # Share of turns answered without error: their SQL ran, or no SQL was needed (a chat message,
+    # a clarifying question).
     success_rate: float
     avg_attempts: float
     p50_ms: float
