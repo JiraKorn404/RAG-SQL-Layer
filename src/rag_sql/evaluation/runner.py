@@ -7,8 +7,11 @@ unless `with_history` (then they are searched, still never saved).
 import logging
 import time
 from collections.abc import Callable, Iterable
+from datetime import datetime
+from functools import partial
 from pathlib import Path
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
 
 from rag_sql.agent.graph import build_graph, default_query_runner
@@ -21,6 +24,7 @@ from rag_sql.history.chat import InMemoryChatStore
 from rag_sql.history.queries import InMemoryQueryHistory, get_query_history
 from rag_sql.llm import ChatModelInfo, get_chat_model, get_embeddings, list_chat_models
 from rag_sql.retrieval import get_retriever
+from rag_sql.tracing import run_config
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +54,19 @@ def reference_results(
 
 
 def run_case(
-    graph: CompiledStateGraph, case: EvalCase, expected: QueryResult | None, *, run: int = 1
+    graph: CompiledStateGraph,
+    case: EvalCase,
+    expected: QueryResult | None,
+    *,
+    run: int = 1,
+    config: RunnableConfig | None = None,
 ) -> CaseResult:
     """Run one case. `expected` is the reference result; None for a no_sql case, which is correct
-    only when the agent replied NO_SQL."""
+    only when the agent replied NO_SQL. `config` is passed to the graph run (tracing)."""
     start = time.perf_counter()
     history = [turn.to_turn() for turn in case.history]
     try:
-        state = graph.invoke({"question": case.question, "history": history})
+        state = graph.invoke({"question": case.question, "history": history}, config=config)
     except Exception as e:
         logger.warning("Case %s failed", case.id, exc_info=True)
         return CaseResult(
@@ -103,12 +112,15 @@ def run_cases(
     expected: dict[str, QueryResult],
     *,
     repeat: int = 1,
+    config_for: Callable[[EvalCase], RunnableConfig] | None = None,
 ) -> list[CaseResult]:
+    """Run every case `repeat` times. `config_for` gives the config of a case's run (tracing)."""
     results = []
     total = len(cases) * repeat
     for run in range(1, repeat + 1):
         for case in cases:
-            result = run_case(graph, case, expected.get(case.id), run=run)
+            config = config_for(case) if config_for else None
+            result = run_case(graph, case, expected.get(case.id), run=run, config=config)
             results.append(result)
             progress = f"[{len(results)}/{total}] {case.id}"
             logger.info(
@@ -151,6 +163,11 @@ def eval_graph(model: ChatModelInfo, settings: Settings, *, with_history: bool, 
     )
 
 
+def case_config(case: EvalCase, *, eval_id: str, model: str, settings: Settings) -> RunnableConfig:
+    """Tracing config of one case's run: one Langfuse session per evaluation, tagged by case."""
+    return run_config("eval", session_id=eval_id, model=model, tags=[case.id], settings=settings)
+
+
 def evaluate(
     models: list[str] | None = None,
     *,
@@ -177,11 +194,13 @@ def evaluate(
         "query_history": get_query_history(s) if with_history else None,
     }
     logger.info("%d case(s), %d run(s) each, %d model(s)", len(cases), repeat, len(chosen))
+    eval_id = f"eval-{datetime.now():%Y%m%d-%H%M%S}"
 
     reports = []
     for model in chosen:
         graph = eval_graph(model, s, with_history=with_history, shared=shared)
-        results = run_cases(graph, cases, expected, repeat=repeat)
+        config_for = partial(case_config, eval_id=eval_id, model=model.name, settings=s)
+        results = run_cases(graph, cases, expected, repeat=repeat, config_for=config_for)
         path = write_results(
             out_dir,
             model.name,

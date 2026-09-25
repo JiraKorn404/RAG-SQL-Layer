@@ -58,7 +58,7 @@ class ScriptedGraph:
         self.items = items
         self.error = error
 
-    def stream(self, _input: dict, stream_mode: list[str]):
+    def stream(self, _input: dict, config: dict | None = None, stream_mode: list[str] = ()):
         yield from self.items
         if self.error is not None:
             raise self.error

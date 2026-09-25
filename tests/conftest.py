@@ -7,7 +7,7 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
-from rag_sql.config import Settings
+from rag_sql.config import Settings, get_settings
 from rag_sql.db.query import QueryResult
 from rag_sql.history.chat import InMemoryChatStore, Turn
 from rag_sql.history.queries import InMemoryQueryHistory
@@ -29,6 +29,16 @@ EXAMPLE_DOC = Document(
 def fake_llm(*replies: str | AIMessage) -> GenericFakeChatModel:
     messages = [r if isinstance(r, AIMessage) else AIMessage(content=r) for r in replies]
     return GenericFakeChatModel(messages=iter(messages))
+
+
+@pytest.fixture(autouse=True)
+def _no_tracing(monkeypatch):
+    """Tests never send traces to Langfuse, whatever the developer's .env says (code that falls
+    back to get_settings() reads it)."""
+    monkeypatch.setenv("LANGFUSE_ENABLED", "false")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture

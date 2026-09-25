@@ -43,6 +43,11 @@ services:
       # The UI only uses the read-only and chat roles, so it never gets admin credentials.
       POSTGRES_USER: ""
       POSTGRES_PASSWORD: ""
+      # Langfuse (docker-compose.langfuse.yml, its own compose project) is published on the host.
+      LANGFUSE_BASE_URL: http://host.docker.internal:${LANGFUSE_PORT:-3000}
+    extra_hosts:
+      # Docker Desktop defines host.docker.internal; this defines it on Linux too.
+      - "host.docker.internal:host-gateway"
     ports:
       # This device only.
       - "127.0.0.1:${WEB_PORT:-8501}:8501"

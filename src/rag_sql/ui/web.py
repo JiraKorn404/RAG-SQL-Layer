@@ -17,6 +17,7 @@ from rag_sql.history.chat import ChatStore, ThreadSummary, get_chat_store, new_t
 from rag_sql.history.queries import get_query_history
 from rag_sql.llm import ChatModelInfo, get_chat_model, list_chat_models
 from rag_sql.retrieval import get_retriever
+from rag_sql.tracing import run_config
 from rag_sql.ui.steps import Step, escape_md, model_step, steps_from_turn
 from rag_sql.ui.web_chat import render_step, run_turn
 
@@ -230,6 +231,7 @@ def main(
                 thread_id,
                 steps,
                 settings.max_sql_retries,
+                config=run_config("web", session_id=thread_id, model=model.name, settings=settings),
                 save_unfinished=lambda turn: store.append(thread_id, {**turn, "model": model.name}),
             )
         st.rerun()  # redraw the sidebar, which now lists this conversation first

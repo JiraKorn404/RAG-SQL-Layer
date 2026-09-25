@@ -14,6 +14,7 @@ from langgraph.graph.state import CompiledStateGraph
 from rag_sql.agent.graph import build_graph
 from rag_sql.config import get_settings
 from rag_sql.history.chat import ChatStore, get_chat_store, new_thread_id
+from rag_sql.tracing import run_config
 from rag_sql.ui.steps import Step, escape_md, steps_from_update
 
 # Rows rendered in the notebook table; the full result stays in the returned state.
@@ -100,15 +101,20 @@ def run_and_display(
     To ask follow-up questions, use `Chat`. Returns nothing so a notebook cell doesn't echo the
     state; for the state itself, use `build_graph().invoke({"question": ...})`.
     """
+    settings = get_settings()
+    # The default graph uses the configured model; another graph's model is on its trace anyway.
+    model = settings.ollama_chat_model if graph is None else None
     graph = graph or _default_graph()
     thread_id = thread_id or new_thread_id()
-    max_retries = get_settings().max_sql_retries
+    max_retries = settings.max_sql_retries
 
     display(Markdown(f"**Question:** {escape_md(question)}"))
     _muted(f"Thread <code>{html.escape(thread_id)}</code>")
     attempts = 0
     for chunk in graph.stream(
-        {"question": question, "thread_id": thread_id}, stream_mode="updates"
+        {"question": question, "thread_id": thread_id},
+        config=run_config("notebook", session_id=thread_id, model=model, settings=settings),
+        stream_mode="updates",
     ):
         for node, update in chunk.items():
             if not update:

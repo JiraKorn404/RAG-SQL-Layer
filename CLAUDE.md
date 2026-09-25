@@ -27,6 +27,7 @@ The design priority is **modularity**. Each concern (config, LLM, database, retr
 | DB access | SQLAlchemy 2.x + psycopg 3 |
 | SQL validation | `sqlglot` (parse, and enforce read-only statements) |
 | CI | GitHub Actions (`.github/workflows/ci.yml`): ruff, stripped notebooks, unit tests |
+| Tracing | Self-hosted **Langfuse** v4 (`docker-compose.langfuse.yml`), through its LangChain callback handler (`tracing.py`); off unless `LANGFUSE_ENABLED` |
 | Metrics / evaluation | Per-node time and tokens in `chat_memory.turn_metrics` (`metrics.py`); scored test questions (`rag_sql/evaluation/`, `evaluation/cases.yaml`) |
 | Config | `pydantic-settings`, loaded from `.env` |
 | Output | Jupyter (`notebooks/`), rendered with `IPython.display` + pandas (optional extra `notebook`) |
@@ -38,6 +39,7 @@ The design priority is **modularity**. Each concern (config, LLM, database, retr
 RAG-SQL-Layer/
 ├── pyproject.toml              # deps (+ extras "web", "notebook"); [project.scripts] -> rag_sql.cli
 ├── docker-compose.yml          # Postgres + pgvector, and the Streamlit web UI (service "web")
+├── docker-compose.langfuse.yml # Langfuse (tracing): its own compose project and databases
 ├── Dockerfile                  # image of the web UI (.dockerignore keeps .env and data out)
 ├── .env.example                # all config keys, no secrets
 ├── .github/workflows/ci.yml    # CI: ruff check + format, nbstripout --verify, pytest
@@ -55,6 +57,7 @@ RAG-SQL-Layer/
 │   ├── llm.py                  # get_chat_model(), get_embeddings() (caches query vectors), list_chat_models()
 │   ├── metrics.py              # NodeMetric/TurnMetrics, usage_of(), summarize(), format_* (pure)
 │   ├── retrieval.py            # schema + few-shot Documents, build_index(), get_retriever()
+│   ├── tracing.py              # run_config(): Langfuse callback + trace attributes for one run
 │   ├── cli.py                  # every CLI: rag-sql-index, -history, -metrics, -eval (argparse, printing)
 │   ├── db/
 │   │   ├── connection.py       # get_engine("reader"|"admin"|"memory"), one per role
@@ -91,6 +94,7 @@ Structure rules:
 - `db/introspect.py` (admin, used by indexing) and `db/query.py` (read-only, used by the agent) stay apart, so the agent's code path never touches admin credentials.
 - `history/chat.py` (chat turns, their metrics, `turn_stats()`) and `history/queries.py` (past queries) are the only modules that touch `chat_memory`, and only through the "memory" engine (the admin engine only for `rag-sql-history disable|enable`).
 - `metrics.py` is pure (types, summaries); storing metrics is `history/chat.py`'s job. `evaluation/scoring.py` is pure too; everything that runs models or queries is in `evaluation/runner.py`, and reporting is in `evaluation/results.py`.
+- `tracing.py` is the only module that imports `langfuse`. Nodes and `graph.py` know nothing of tracing: the callers of `graph.stream()` / `invoke()` pass `config=run_config(...)`.
 - CLIs live in `cli.py` only: argument parsing and printing there, the work in the library modules (no `main()` elsewhere).
 - Split `retrieval.py` back into `retrieval/indexer.py` + `retrieval/retriever.py` if it grows past about 250 lines.
 
@@ -173,6 +177,22 @@ Keep rendering separate from agent logic. The graph must also be usable without 
 - One graph per model, built on demand (`st.cache_resource` keyed by model name). The retriever, query runner, chat store and query history are built once and shared by all of them, so a model doesn't open its own DB pools. Everything is shared by all browser sessions.
 - A new question sent while a run is going stops that run. What it had shown so far is kept. A run that doesn't reach `save_turn` (stopped by a new question, or failed with an exception, e.g. Ollama unreachable) is still saved, through `run_turn(save_unfinished=...)`, as a turn whose error says why (`INTERRUPTED` or the exception), with what it produced so far, metrics included (`run_turn` adds up the per-node `metrics` of the updates, like the graph's reducer). So a reloaded conversation, and the next follow-up, match what was shown.
 
+## Tracing (Langfuse)
+
+`tracing.run_config(source, *, session_id=, model=, tags=)` returns the `RunnableConfig` of one run: `{}` when `LANGFUSE_ENABLED` is off, else a new Langfuse `CallbackHandler` (one per run) and trace attributes in `metadata` (`langfuse_trace_name`, `langfuse_session_id`, `langfuse_tags`). LangGraph passes the callbacks down to every node and to the `llm.invoke()` / `retriever.invoke()` calls in them, so one trace holds a span per node (every SQL attempt), the retrieved documents and each model call (prompt, reply, `reasoning_content`, tokens). Nodes need no change for it, as for streaming.
+
+| Caller | Source tag | Session | Other tags |
+|---|---|---|---|
+| `ui/notebook.py` `run_and_display` | `notebook` | thread id | `OLLAMA_CHAT_MODEL` (default graph only) |
+| `ui/web.py` -> `web_chat.run_turn(config=)` | `web` | thread id | chosen model |
+| `evaluation/runner.py` `run_case(config=)` | `eval` | `eval-<timestamp>`, one per `rag-sql-eval run` | model, case id |
+
+- The Langfuse client is built on the first traced run, with the keys from `Settings` (cached). Traces are sent in the background and flushed at exit. A client that can't be built is logged and the run goes on untraced; an unreachable server only loses traces.
+- A run stopped mid-way (a new question in the web UI) ends its trace with the root span at level `ERROR`.
+- The `langfuse` LangChain integration needs the `langchain` package (it checks its version), hence that dependency.
+- Langfuse v4 serves observations at `/api/public/v2/observations` (the v1 trace endpoints return 404 in its events-only mode).
+- `chat_memory.turn_metrics` stays the source of the UI timing summary and `rag-sql-metrics`; Langfuse is for inspecting runs.
+
 ## Configuration
 
 All settings are read in `src/rag_sql/config.py` through a single `Settings` class (`get_settings()` cached). No module reads `os.environ` directly. Every key goes into `.env.example`. Numeric keys are range-checked (`Field(gt=..., ge=..., le=...)`), so a bad value fails at startup.
@@ -197,6 +217,10 @@ All settings are read in `src/rag_sql/config.py` through a single `Settings` cla
 | `QUERY_HISTORY_K` | Most similar past queries given to the model (0 = none; queries are still saved) | `5` |
 | `QUERY_HISTORY_MIN_SIMILARITY` | Cosine similarity cutoff for past queries (tune per embedding model) | `0.75` |
 | `WEB_PORT` | Host port of the web UI, bound to `127.0.0.1` (docker compose only; not in `Settings`) | `8501` |
+| `LANGFUSE_ENABLED` | Trace runs to Langfuse (needs both keys) | `false` |
+| `LANGFUSE_BASE_URL` | Langfuse server (the web container uses `host.docker.internal`) | `http://localhost:3000` |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | Project keys; the server creates the project with them | `pk-lf-...` / `sk-lf-...` |
+| `LANGFUSE_PORT`, `LANGFUSE_INIT_USER_EMAIL` / `_PASSWORD`, `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_SALT`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_DB_PASSWORD`, `LANGFUSE_CLICKHOUSE_PASSWORD`, `LANGFUSE_REDIS_PASSWORD`, `LANGFUSE_MINIO_PASSWORD` | Langfuse server only (`docker-compose.langfuse.yml`; not in `Settings`); hex secrets | `openssl rand -hex 32` |
 
 ## Safety rules for SQL execution (must hold)
 
@@ -208,6 +232,7 @@ All settings are read in `src/rag_sql/config.py` through a single `Settings` cla
 - `rag-sql-eval` runs the reference SQL of `evaluation/cases.yaml` through `validate_sql()` and `run_query()` as the read-only role, like the agent's SQL. Eval runs have no `thread_id`, so they save nothing to chat or query history.
 - Chat history lives in its own schema, `chat_memory`, written only by the chat role (`CHAT_DB_USER`) through fixed, parameterized statements in `history/chat.py` and `history/queries.py`. That role has `SELECT` + `INSERT` on `chat_memory.chat_turns`, `chat_memory.query_examples` and `chat_memory.turn_metrics` and nothing else (history is append-only and kept forever; only the admin can disable or enable examples). `APP_DB_USER` has no access to `chat_memory`, so generated SQL can't read past conversations. Never run LLM output as the chat role. Created by `db/init/04-chat-memory.sh`, which is safe to re-run; on an existing volume run it like `02-roles.sh` above.
 - The web container gets `.env` through compose with `POSTGRES_USER` / `POSTGRES_PASSWORD` blanked, so it never holds admin credentials; `.dockerignore` keeps `.env` out of the image. Its port is published on `127.0.0.1` only (Streamlit has no login, and the sidebar shows every saved conversation).
+- Langfuse traces hold questions, SQL, result rows and thinking in full. Langfuse runs as its own compose project with its own Postgres, never the agent's database or roles; only its UI is published, on `127.0.0.1`, with sign-up disabled and telemetry off. Tracing never blocks an answer, and tests never trace (`tests/conftest.py` forces `LANGFUSE_ENABLED=false`).
 
 ## Ollama over Tailscale
 
@@ -251,6 +276,9 @@ uv run jupyter lab notebooks/demo.ipynb
 docker compose up -d --build              # starts Postgres + web; --build after code changes
 uv sync --extra web && uv run streamlit run src/rag_sql/ui/web.py   # local dev, without Docker
 
+# Tracing (Langfuse UI: http://localhost:3000; then LANGFUSE_ENABLED=true)
+docker compose -f docker-compose.langfuse.yml up -d
+
 # Quality (CI runs the same: .github/workflows/ci.yml)
 uv run pytest
 uv run ruff check . && uv run ruff format .
@@ -271,6 +299,7 @@ uv run ruff check . && uv run ruff format .
 - Integration tests that need Postgres or Ollama are marked `@pytest.mark.integration` and skipped by default (and in CI).
 - Give fakes usage with `AIMessage(usage_metadata=..., response_metadata={"total_duration": ...})` to test metrics; `tests/test_graph.py::OllamaLikeModel` streams like ChatOllama (usage on the last chunk).
 - `tests/test_eval_*.py` cover cases, scoring, the runner and the results without network, `tests/test_cli.py` the CLIs; the references run in `tests/test_integration.py`.
+- `tests/test_tracing.py` checks `run_config()` with a fake client and handler, and that a run's callbacks reach the nodes' model calls. An autouse fixture in `conftest.py` keeps tracing off, since code that falls back to `get_settings()` reads the developer's `.env`.
 - Test what a node shows in `tests/test_steps.py` (pure); `tests/test_notebook.py` and `tests/test_web.py` only check the drawing.
 
 ## When changing things

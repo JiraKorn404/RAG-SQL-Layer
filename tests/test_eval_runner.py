@@ -75,7 +75,7 @@ class RecordingGraph:
         self.inputs: list[dict] = []
         self.error = error
 
-    def invoke(self, graph_input: dict) -> dict:
+    def invoke(self, graph_input: dict, config: dict | None = None) -> dict:
         self.inputs.append(graph_input)
         if self.error:
             raise self.error

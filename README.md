@@ -148,6 +148,23 @@ uv run rag-sql-eval compare evaluation/results/A.json evaluation/results/B.json 
 
 Run it before and after changing a prompt, the retrieval or the model, then `compare` the two files. A full run takes about a minute per case with a thinking model, more when the model has to load first.
 
+### Tracing (Langfuse)
+
+With tracing on, every run, from the notebook, the web UI or an eval, becomes a trace in a self-hosted [Langfuse](https://langfuse.com). It shows each step (every SQL attempt too), the documents retrieved, and each model call with its exact prompt, reply, thinking and tokens. A chat thread is a Langfuse session, and so is an eval run; traces are tagged `web`, `notebook` or `eval`, with the model (and the case id for evals).
+
+Langfuse runs in Docker next to Postgres, as its own compose project with its own databases (Postgres, ClickHouse, Redis, MinIO). It needs a few GB of RAM.
+
+1. Set the `LANGFUSE_*` keys in `.env` (see `.env.example`): the project keys, a login, and random secrets (`openssl rand -hex 32`). The project and the login are created on the first start.
+2. Start it, then open **http://localhost:3000** and log in with `LANGFUSE_INIT_USER_EMAIL` / `LANGFUSE_INIT_USER_PASSWORD`:
+
+   ```sh
+   docker compose -f docker-compose.langfuse.yml up -d
+   docker compose -f docker-compose.langfuse.yml ps      # wait for langfuse-web "healthy"
+   ```
+3. Set `LANGFUSE_ENABLED=true`, and restart what runs the agent (`docker compose up -d` for the web UI, the notebook kernel).
+
+Traces hold the questions, the SQL, the result rows and the thinking in full, so the UI is reachable from this device only and sign-up is disabled. If Langfuse is down, the agent still answers; traces are just lost.
+
 ## Development
 
 ```sh

@@ -2,9 +2,9 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Repo root, so `.env` is found whatever the working directory is (the notebook runs in notebooks/).
@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     query_history_k: int = Field(5, ge=0)  # most retrieved (0 = off; queries are still saved)
     query_history_min_similarity: float = Field(0.75, ge=0, le=1)  # cosine similarity cutoff
 
+    # Langfuse tracing (tracing.py); the server is docker-compose.langfuse.yml
+    langfuse_enabled: bool = False
+    langfuse_base_url: str = "http://localhost:3000"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: SecretStr = SecretStr("")
+
     @field_validator("db_schemas", mode="before")
     @classmethod
     def _split_schemas(cls, value: object) -> object:
@@ -67,6 +73,14 @@ class Settings(BaseSettings):
         if "chat_memory" in value:
             raise ValueError("chat_memory holds chat history and must never be shown to the model")
         return value
+
+    @model_validator(mode="after")
+    def _langfuse_keys(self) -> Self:
+        if self.langfuse_enabled and not (
+            self.langfuse_public_key and self.langfuse_secret_key.get_secret_value()
+        ):
+            raise ValueError("LANGFUSE_ENABLED needs LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY")
+        return self
 
 
 @lru_cache

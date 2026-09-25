@@ -10,6 +10,7 @@ from typing import Any
 
 import streamlit as st
 from langchain_core.messages import BaseMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
 
 from rag_sql.agent.nodes import turn_from_state
@@ -147,6 +148,7 @@ def run_turn(
     steps: list[Step],
     max_retries: int,
     *,
+    config: RunnableConfig | None = None,
     save_unfinished: Callable[[Turn], None] | None = None,
 ) -> None:
     """Run the agent on `question`, rendering as it goes and appending to `steps`.
@@ -154,6 +156,7 @@ def run_turn(
     `steps` is filled in place, so a run cut short by a new question keeps what it showed. A run
     that doesn't reach save_turn, because it failed or a new question stopped it, is passed to
     `save_unfinished` with its error, so the saved conversation matches what was shown.
+    `config` is passed to the graph run (tracing, see tracing.py).
     """
     attempts = 0
     live: LiveCall | None = None
@@ -164,7 +167,9 @@ def run_turn(
     error = INTERRUPTED
     try:
         for mode, payload in graph.stream(
-            {"question": question, "thread_id": thread_id}, stream_mode=["updates", "messages"]
+            {"question": question, "thread_id": thread_id},
+            config=config,
+            stream_mode=["updates", "messages"],
         ):
             if mode == "messages":
                 message, metadata = payload

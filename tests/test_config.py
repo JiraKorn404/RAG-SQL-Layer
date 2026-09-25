@@ -16,6 +16,8 @@ from rag_sql.config import Settings
         {"query_history_min_similarity": 1.5},
         {"postgres_port": 70000},
         {"db_schemas": "public,chat_memory"},
+        {"langfuse_enabled": True},  # without keys
+        {"langfuse_enabled": True, "langfuse_public_key": "pk-lf-x"},
     ],
 )
 def test_rejects_out_of_range_values(overrides: dict) -> None:
